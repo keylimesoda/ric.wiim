@@ -102,7 +102,7 @@ function chipState(snap, daemonReady) {
 }
 
 function heroTitle(snap) {
-  if (!snap || !snap.online) return "Play Room Speakers"
+  if (!snap || !snap.online) return "WiiM"
   var t = snap.meta && snap.meta.title ? snap.meta.title : ""
   if (t) return t
   return STATUS_LABEL[snap.player.status] || "Idle"
@@ -253,7 +253,7 @@ function fixtureSnapshot() {
       artUrl: "", sampleRate: "44100", bitDepth: "24"
     },
     device: {
-      name: "Play Room Speakers", model: "WiiM Pro Receiver",
+      name: "Living Room Zone", model: "WiiM Pro",
       firmware: "Linkplay.4.8.827634", uuid: "FIXTURE", mac: "40:D9:5A:30:39:3C",
       ip: "192.168.1.50", group: "0", presetKeys: 12, internet: true
     },

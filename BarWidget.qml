@@ -428,10 +428,21 @@ Panel {
     console.log("WIIM-INIT fixture mode armed")
   }
 
+  // A daemon that started before fixture mode was injected must be stopped:
+  // its live snapshots would otherwise overwrite the fixture state.
+  function stopDaemon() {
+    restartTimer.stop()
+    if (daemonProc.running) {
+      daemonProc.running = false
+      daemonProc.terminate()
+    }
+  }
+
   // The host injects `settings` after Component.onCompleted, so fixture mode
   // must also be armed from the settings-changed edge, not only on completion.
   onFixtureModeChanged: {
     if (fixtureMode) {
+      stopDaemon()
       initFixture()
     } else {
       snap = null
