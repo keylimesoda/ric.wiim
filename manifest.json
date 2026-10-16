@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "ric.wiim",
+  "name": "WiiM Controller",
+  "version": "1.0.0",
+  "author": "Ric",
+  "license": "MIT",
+  "description": "WiiM / Linkplay zone in the bar: now playing, transport, seek, volume, presets, sources, EQ, sleep timer, and local-library streaming. Keyboard-first panel; backed by the bundled wiim CLI (local HTTPS API, no cloud).",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "WiiM",
+    "description": "Control the WiiM zone: click for the panel, middle-click play/pause, scroll to change volume.",
+    "category": "Media",
+    "aliases": ["wiim", "music", "tidal", "spotify", "play room"],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "deviceIp": "192.168.183.8",
+      "musicDir": "~/Music",
+      "volStep": 5,
+      "pollMs": 500,
+      "barText": true,
+      "fixture": false
+    },
+    "schema": [
+      {
+        "key": "deviceIp",
+        "type": "string",
+        "label": "Device IP",
+        "description": "WiiM device address (find it with: wiim discover). Empty = auto-discover at startup.",
+        "defaultValue": "192.168.183.8"
+      },
+      {
+        "key": "musicDir",
+        "type": "string",
+        "label": "Music directory",
+        "description": "Local library served to the device by URL.",
+        "defaultValue": "~/Music"
+      },
+      {
+        "key": "volStep",
+        "type": "integer",
+        "label": "Volume step",
+        "min": 1,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "pollMs",
+        "type": "integer",
+        "label": "State poll interval (ms)",
+        "description": "How often the daemon polls the device for state changes.",
+        "min": 200,
+        "max": 2000,
+        "step": 100,
+        "defaultValue": 500
+      },
+      {
+        "key": "barText",
+        "type": "bool",
+        "label": "Show now-playing text in bar",
+        "defaultValue": true
+      },
+      {
+        "key": "fixture",
+        "type": "bool",
+        "label": "Fixture mode (demo data, no device)",
+        "defaultValue": false
+      }
+    ]
+  }
+}

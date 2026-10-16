@@ -29,6 +29,7 @@ class FixtureState:
         self.album = "Unknown"
         self.art = ""
         self.eqstat = "Off"
+        self.eq_index = "-1"
         self.shutdown = 0
         self.playing_url = None
         self.playlist = None
@@ -50,6 +51,7 @@ class FixtureState:
             "totlen": str(self.totlen), "alarmflag": "0",
             "plicount": str(self.plicount), "plicurr": str(self.plicurr),
             "vol": str(self.vol), "mute": self.mute,
+            "eq": self.eq_index,
             "Title": HEX(self.title), "Artist": HEX(self.artist),
             "Album": HEX(self.album),
         }
@@ -173,6 +175,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             name = cmd[len("EQLoad:"):]
             if name in st.eq_list:
                 st.eqstat = "On"
+                st.eq_index = str(st.eq_list.index(name))
                 return {"status": "OK"}
             return {"status": "Failed"}
         if cmd == "EQOn":
@@ -180,6 +183,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             return {"status": "OK"}
         if cmd == "EQOff":
             st.eqstat = "Off"
+            st.eq_index = "-1"
             return {"status": "OK"}
         if cmd.startswith("setShutdown:"):
             st.shutdown = int(cmd.split(":")[1])

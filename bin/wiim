@@ -463,6 +463,8 @@ def snapshot(dev, full=True):
             "queueCount": int(player.get("plicount", 0) or 0),
             "queueIndex": int(player.get("plicurr", 0) or 0),
             "isSlave": str(player.get("type", "0")) == "1",
+            # "eq" is the loaded EQ preset index into EQGetList (or -1)
+            "eqIndex": int(player.get("eq", -1) if str(player.get("eq", "")).lstrip("-").isdigit() else -1),
         },
         "meta": normalize_meta(meta, player),
     }
