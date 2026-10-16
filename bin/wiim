@@ -1,0 +1,1366 @@
+#!/usr/bin/env python3
+"""wiim — Linux controller for WiiM / Linkplay network audio devices.
+
+Dependency-free (Python 3 stdlib only). Speaks the device's local HTTPS
+API documented in the official "HTTP API for WiiM Products v1.2" PDF
+(https://www.wiimhome.com/pdf/HTTP%20API%20for%20WiiM%20Products.pdf)
+plus a handful of community-documented commands (see docs/ in the repo).
+
+SECURITY / NETWORK
+------------------
+* The device serves a self-signed certificate on port 443; TLS
+  verification is disabled. There are no credentials on this channel —
+  it is the same trust model as the WiiM Home app on the LAN.
+* `serve`/`daemon` start a local HTTP file server so the device can
+  play local music by URL. It binds 0.0.0.0 on an ephemeral port and
+  exposes ONLY files under the configured music dir (no listings, no
+  dotfiles, Range supported).
+
+USAGE
+-----
+  wiim discover [--json]                 find WiiM devices (SSDP)
+  wiim status [--full]                   merged device snapshot as JSON
+  wiim watch [--interval S]              JSON-lines change stream
+  wiim play|pause|toggle|next|prev|stop  transport
+  wiim seek <sec>                        seek within the current track
+  wiim vol <0-100|+N|-N>                 set / nudge volume
+  wiim mute <on|off|toggle>              mute
+  wiim source <id>                       wifi|bluetooth|line-in|optical|udisk
+  wiim preset <1-12>                     play a preset configured in WiiM Home
+  wiim eq <name> | wiim eq-on | eq-off   EQ preset / EQ bypass
+  wiim loop <sequence|single|shuffle|none>
+  wiim sleep <sec|off>                   sleep timer (device standby)
+  wiim play-url <url>                    stream any URL on the device
+  wiim library [rel]                     browse the music dir (JSON)
+  wiim play-file <rel>                   serve + play one library file
+  wiim play-album <rel>                  serve + play a whole album dir
+  wiim serve [--dir D] [--port P]        run the file server (foreground)
+  wiim daemon [--dir D] [--port P]       resident: watch + serve + stdin cmds
+  wiim media <playPause|next|previous>   smart media-key router (WiiM vs MPRIS)
+  wiim config show | wiim config set <k> <v>
+
+Global options: --ip IP  --timeout SECONDS  --config PATH
+Exit codes: 0 ok, 1 usage, 2 device offline / request failed.
+"""
+
+import argparse
+import concurrent.futures
+import contextlib
+import hashlib
+import http.server
+import json
+import os
+import queue
+import re
+import select
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_TIMEOUT = 4.0
+POLL_INTERVAL = 0.5           # watch/daemon device poll
+FULL_REFRESH_EVERY = 10.0     # seconds between full snapshots in watch
+AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".m4b", ".aac", ".ogg", ".opus",
+              ".wav", ".wma", ".aiff", ".aif", ".alac", ".ape", ".dsf",
+              ".dff", ".mka", ".m4v"}
+CONFIG_PATH_DEFAULT = os.path.expanduser("~/.config/wiim/config.json")
+DEFAULT_MUSIC_DIR = os.path.expanduser("~/Music")
+
+# --------------------------------------------------------------------------
+# constants: device enums
+# --------------------------------------------------------------------------
+
+# getPlayerStatus "mode" -> (id, label). Streaming modes mean the device is
+# receiving a stream (wifi family); physical modes are direct inputs.
+MODE_TABLE = {
+    "-1": ("none", "Idle"),
+    "0":  ("none", "Idle"),
+    "1":  ("airplay", "AirPlay"),
+    "2":  ("dlna", "DLNA"),
+    "10": ("wifi", "WiiM"),
+    "11": ("udisk", "USB disk"),
+    "12": ("wifi", "WiiM"),
+    "13": ("wifi", "WiiM"),
+    "14": ("wifi", "WiiM"),
+    "15": ("wifi", "WiiM"),
+    "16": ("wifi", "TF card"),
+    "17": ("wifi", "WiiM"),
+    "18": ("wifi", "WiiM"),
+    "19": ("wifi", "WiiM"),
+    "31": ("spotify", "Spotify Connect"),
+    "32": ("tidal", "TIDAL Connect"),
+    "40": ("line-in", "Line-in"),
+    "41": ("bluetooth", "Bluetooth"),
+    "42": ("udisk", "USB storage"),
+    "43": ("optical", "Optical-in"),
+    "50": ("mirror", "Mirror"),
+    "60": ("voicemail", "Voicemail"),
+    "99": ("slave", "Group slave"),
+}
+# modes where the device plays a stream we can transport-control
+STREAM_MODES = {"airplay", "dlna", "wifi", "spotify", "tidal", "udisk"}
+
+# getPlayerStatus "loop" read codes -> name
+LOOP_READ = {"0": "sequence", "1": "single", "2": "shuffle",
+             "3": "shuffle-once", "4": "none"}
+# UI loop cycle -> setPlayerCmd:loopmode write codes (documented subset)
+LOOP_WRITE = {"sequence": "-1", "single": "1", "shuffle": "2", "none": "0"}
+LOOP_LABEL = {"sequence": "Loop all", "single": "Repeat one",
+              "shuffle": "Shuffle", "none": "No repeat",
+              "shuffle-once": "Shuffle once"}
+
+# switchmode ids accepted by the firmware
+SOURCE_IDS = ["wifi", "bluetooth", "line-in", "optical", "udisk"]
+SOURCE_LABEL = {"wifi": "Wi-Fi", "bluetooth": "Bluetooth", "line-in": "Line-in",
+                "optical": "Optical", "udisk": "USB", "airplay": "AirPlay",
+                "dlna": "DLNA", "spotify": "Spotify", "tidal": "TIDAL",
+                "none": "Idle", "mirror": "Mirror", "slave": "Group",
+                "voicemail": "Voicemail"}
+
+OUTPUT_HW = {"1": "Optical out", "2": "Line out", "3": "Coax out"}
+
+
+class WiimError(Exception):
+    pass
+
+
+class OfflineError(WiimError):
+    pass
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+def load_config(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def resolve_ip(args):
+    if args.ip:
+        return args.ip
+    cfg = load_config(args.config)
+    ip = cfg.get("ip")
+    if ip:
+        return str(ip)
+    # last resort: quick discovery, first hit
+    for dev in discover(timeout=min(args.timeout, 2.5)):
+        return dev["ip"]
+    raise OfflineError("no device configured (wiim config set ip <ip> "
+                       "or run: wiim discover)")
+
+
+# --------------------------------------------------------------------------
+# HTTP client
+# --------------------------------------------------------------------------
+
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+class Device:
+    """One WiiM device's local HTTPS API."""
+
+    def __init__(self, ip, timeout=DEFAULT_TIMEOUT):
+        self.ip = ip
+        self.timeout = timeout
+        # Test-only override (fixture server); production uses device HTTPS.
+        self.base = os.environ.get("WIIM_BASE") or ("https://" + ip)
+
+    def _get(self, command):
+        url = "%s/httpapi.asp?command=%s" % (
+            self.base, urllib.parse.quote(command, safe=":"))
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout,
+                                        context=_SSL_CTX) as resp:
+                return resp.read().decode("utf-8", "replace").strip()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, (ConnectionError, socket.timeout, TimeoutError)) \
+                    or "timed out" in str(reason).lower() \
+                    or "connection refused" in str(reason).lower():
+                raise OfflineError("device unreachable: %s" % reason) from e
+            raise WiimError("request failed: %s" % reason) from e
+
+    def raw(self, command):
+        return self._get(command)
+
+    def json(self, command):
+        text = self._get(command)
+        if not text:
+            raise WiimError("empty response for %s" % command)
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise WiimError("non-JSON response for %s: %r" %
+                            (command, text[:120])) from None
+
+    # ---- reads -----------------------------------------------------------
+
+    def status_ex(self):
+        return self.json("getStatusEx")
+
+    def player_status(self):
+        return self.json("getPlayerStatus")
+
+    def meta(self):
+        try:
+            data = self.json("getMetaInfo")
+        except WiimError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        md = data.get("metaData")
+        if not isinstance(md, dict):
+            return None
+        # firmware keys may carry trailing spaces (documented quirk)
+        return {str(k).strip(): v for k, v in md.items()}
+
+    def presets(self):
+        try:
+            data = self.json("getPresetInfo")
+        except WiimError:
+            return []
+        out = []
+        for p in data.get("preset_list", []):
+            if not isinstance(p, dict):
+                continue
+            out.append({
+                "number": int(p.get("number", 0) or 0),
+                "name": str(p.get("name", "")),
+                "source": str(p.get("source", "")),
+                "picurl": str(p.get("picurl", "")),
+            })
+        return sorted(out, key=lambda p: p["number"])
+
+    def eq_stat(self):
+        try:
+            data = self.json("EQGetStat")
+        except WiimError:
+            return None
+        if isinstance(data, dict):
+            if "EQStat" in data:
+                return str(data["EQStat"])
+            if data.get("status") == "Failed":
+                return None
+        return None
+
+    def eq_list(self):
+        try:
+            data = self.json("EQGetList")
+        except WiimError:
+            return []
+        return [str(x) for x in data] if isinstance(data, list) else []
+
+    def output_mode(self):
+        try:
+            data = self.json("getNewAudioOutputHardwareMode")
+        except WiimError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def shutdown_timer(self):
+        try:
+            text = self._get("getShutdown")
+            return int(text)
+        except (WiimError, ValueError):
+            return None
+
+    def input_capability(self):
+        """Authoritative input list (community command; misspelled in fw)."""
+        try:
+            data = self.json("getAudioInputCapbility")
+        except WiimError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return [str(x.get("mode", "")) for x in data.get("audioInput", [])
+                if isinstance(x, dict)]
+
+    def input_enable(self):
+        try:
+            data = self.json("getAudioInputEnable")
+        except WiimError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        out = {}
+        for x in data.get("audioInput", []):
+            if isinstance(x, dict):
+                out[str(x.get("mode", ""))] = bool(int(x.get("enable", 1) or 0))
+        return out
+
+    def mode_rename(self):
+        try:
+            data = self.json("getModeRename")
+        except WiimError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    # ---- writes ----------------------------------------------------------
+
+    def cmd(self, command):
+        text = self._get(command)
+        if text.upper().startswith("UNKNOWN"):
+            raise WiimError("unsupported command on this firmware")
+        return text
+
+    def transport(self, action):
+        return self.cmd("setPlayerCmd:" + action)
+
+    def set_volume(self, value):
+        v = max(0, min(100, int(value)))
+        return self.cmd("setPlayerCmd:vol:%d" % v)
+
+    def set_mute(self, on):
+        return self.cmd("setPlayerCmd:mute:%d" % (1 if on else 0))
+
+    def set_loop(self, name):
+        if name not in LOOP_WRITE:
+            raise WiimError("unknown loop mode: %s" % name)
+        return self.cmd("setPlayerCmd:loopmode:%s" % LOOP_WRITE[name])
+
+    def set_source(self, source_id):
+        return self.cmd("setPlayerCmd:switchmode:%s" % source_id)
+
+    def seek(self, seconds):
+        return self.cmd("setPlayerCmd:seek:%d" % max(0, int(seconds)))
+
+    def play_url(self, url):
+        return self.cmd("setPlayerCmd:play:" +
+                        urllib.parse.quote(url, safe=":/?&=%"))
+
+    def play_playlist(self, url, index=0):
+        # hex_playlist avoids ':' ambiguity between url and index
+        return self.cmd("setPlayerCmd:hex_playlist:%s:%d" %
+                        (url.encode("utf-8").hex(), index))
+
+    def preset(self, number):
+        n = int(number)
+        if not 1 <= n <= 12:
+            raise WiimError("preset number out of range: %s" % number)
+        return self.cmd("MCUKeyShortClick:%d" % n)
+
+    def eq_load(self, name):
+        return self.cmd("EQLoad:" + name)
+
+    def eq_on(self):
+        return self.cmd("EQOn")
+
+    def eq_off(self):
+        return self.cmd("EQOff")
+
+    def sleep_timer(self, seconds):
+        if seconds is None:
+            return self.cmd("setShutdown:-1")
+        s = int(seconds)
+        if s <= 0:
+            raise WiimError("sleep seconds must be > 0 (0 would power off)")
+        return self.cmd("setShutdown:%d" % s)
+
+
+# --------------------------------------------------------------------------
+# snapshot merge
+# --------------------------------------------------------------------------
+
+def hex_decode(text):
+    if not text:
+        return ""
+    try:
+        return bytes.fromhex(text).decode("utf-8", "replace").strip()
+    except ValueError:
+        return str(text)
+
+
+def normalize_meta(meta, player):
+    """Prefer getMetaInfo; fall back to hex fields in getPlayerStatus."""
+    title = artist = album = art = ""
+    rate = depth = ""
+    if meta:
+        title = str(meta.get("title", "") or "")
+        artist = str(meta.get("artist", "") or "")
+        album = str(meta.get("album", "") or "")
+        art = str(meta.get("albumArtURI", "") or meta.get("albumArtUrl", "") or "")
+        rate = str(meta.get("sampleRate", "") or "")
+        depth = str(meta.get("bitDepth", "") or "")
+    if not title:
+        title = hex_decode(player.get("Title", ""))
+        artist = artist or hex_decode(player.get("Artist", ""))
+        album = album or hex_decode(player.get("Album", ""))
+    if title == "Unknown":
+        title = ""
+    if artist == "Unknown":
+        artist = ""
+    if album == "Unknown":
+        album = ""
+    return {"title": title, "artist": artist, "album": album,
+            "artUrl": art, "sampleRate": rate, "bitDepth": depth}
+
+
+def build_sources(cap, enable, rename, active_id):
+    """Merge capability + enable + rename overlays into a source list."""
+    ids = [s for s in (cap or SOURCE_IDS) if s in SOURCE_IDS] or SOURCE_IDS
+    out = []
+    for sid in ids:
+        if enable and enable.get(sid) is False and sid != active_id:
+            continue
+        label = SOURCE_LABEL.get(sid, sid)
+        if rename and sid in rename and rename[sid]:
+            label = str(rename[sid])
+        out.append({"id": sid, "label": label, "active": sid == active_id})
+    # the active source must always be visible even if not in the list
+    if active_id and active_id not in ids and active_id not in ("none",):
+        out.append({"id": active_id,
+                    "label": SOURCE_LABEL.get(active_id, active_id),
+                    "active": True})
+    return out
+
+
+def snapshot(dev, full=True):
+    """Merged device snapshot. full=False is the fast watch path."""
+    player = dev.player_status()
+    meta = dev.meta()
+
+    mode_id = player.get("mode", "0")
+    src_id, src_label = MODE_TABLE.get(str(mode_id), ("wifi", "WiiM"))
+
+    snap = {
+        "online": True,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "player": {
+            "status": str(player.get("status", "none")),
+            "mode": str(mode_id),
+            "source": src_id,
+            "sourceLabel": src_label,
+            "loop": LOOP_READ.get(str(player.get("loop", "")), "none"),
+            "curpos": int(player.get("curpos", 0) or 0),
+            "totlen": int(player.get("totlen", 0) or 0),
+            "vol": int(player.get("vol", 0) or 0),
+            "mute": str(player.get("mute", "0")) == "1",
+            "queueCount": int(player.get("plicount", 0) or 0),
+            "queueIndex": int(player.get("plicurr", 0) or 0),
+            "isSlave": str(player.get("type", "0")) == "1",
+        },
+        "meta": normalize_meta(meta, player),
+    }
+
+    if not full:
+        return snap
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        f_dev = pool.submit(_safe, dev.status_ex)
+        f_pre = pool.submit(_safe, dev.presets)
+        f_eqs = pool.submit(_safe, dev.eq_stat)
+        f_eql = pool.submit(_safe, dev.eq_list)
+        f_out = pool.submit(_safe, dev.output_mode)
+        f_shut = pool.submit(_safe, dev.shutdown_timer)
+        f_cap = pool.submit(_safe, dev.input_capability)
+        f_en = pool.submit(_safe, dev.input_enable)
+        f_ren = pool.submit(_safe, dev.mode_rename)
+
+        info = f_dev.result() or {}
+        preset_list = f_pre.result() or []
+        eq_stat = f_eqs.result()
+        eqlist = f_eql.result() or []
+        out_mode = f_out.result() or {}
+        shut = f_shut.result()
+        cap = f_cap.result()
+        en = f_en.result()
+        ren = f_ren.result()
+
+    snap["device"] = {
+        "name": str(info.get("DeviceName") or info.get("ssid") or
+                    info.get("GroupName") or dev.ip),
+        "model": str(info.get("project", "")),
+        "firmware": str(info.get("firmware", "")),
+        "uuid": str(info.get("uuid", "")),
+        "mac": str(info.get("MAC", "")),
+        "ip": dev.ip,
+        "group": str(info.get("group", "0")),
+        "presetKeys": int(info.get("preset_key", 0) or 0),
+        "internet": str(info.get("internet", "")) == "1",
+    }
+    snap["presets"] = preset_list
+    snap["eq"] = {
+        "stat": eq_stat or "unknown",
+        "list": eqlist,
+    }
+    snap["output"] = {
+        "hardware": OUTPUT_HW.get(str(out_mode.get("hardware", "")), ""),
+    }
+    snap["sleep"] = {"sec": shut if shut is not None else 0}
+    snap["sources"] = build_sources(cap, en, ren, snap["player"]["source"])
+    return snap
+
+
+def _safe(fn):
+    """Run a read; a failing optional read must not sink the snapshot."""
+    try:
+        return fn()
+    except (WiimError, OfflineError):
+        return None
+
+
+def snapshot_signature(snap):
+    """Stable hash of everything a UI cares about (excludes ts/curpos drift)."""
+    p = snap.get("player", {})
+    core = {
+        "status": p.get("status"), "mode": p.get("mode"),
+        "loop": p.get("loop"), "vol": p.get("vol"), "mute": p.get("mute"),
+        "queueCount": p.get("queueCount"), "queueIndex": p.get("queueIndex"),
+        "totlen": p.get("totlen"), "isSlave": p.get("isSlave"),
+        "meta": snap.get("meta"),
+    }
+    if "presets" in snap:
+        core["presets"] = snap["presets"]
+        core["eq"] = snap.get("eq")
+        core["sleep"] = snap.get("sleep")
+        core["sources"] = snap.get("sources")
+        core["device"] = snap.get("device")
+    return hashlib.sha1(json.dumps(core, sort_keys=True).encode()).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# discovery: avahi (mDNS) first, SSDP fallback
+# --------------------------------------------------------------------------
+#
+# On this network the AP blocks multicast from clients, so raw mDNS/SSDP
+# queries get no replies; avahi (running on the desktop) already resolves
+# _linkplay._tcp, so it is the primary path. SSDP stays as a fallback for
+# machines without avahi.
+
+SSDP_SEARCH = (
+    "M-SEARCH * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:19190\r\n"
+    'MAN: "ssdp:discover"\r\n'
+    "MX: 2\r\n"
+    "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"
+    "\r\n"
+).encode()
+
+
+def _avahi_linkplay(timeout):
+    """Resolve _linkplay._tcp via avahi-browse; returns [(ip, name)]."""
+    out = []
+    try:
+        r = subprocess.run(
+            ["avahi-browse", "-r", "-t", "-p", "_linkplay._tcp"],
+            capture_output=True, text=True, timeout=timeout + 2)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return out
+    for line in r.stdout.splitlines():
+        if not line.startswith(("=", "+")):
+            continue
+        parts = line.split(";")
+        if len(parts) < 8:
+            continue
+        name, ip = parts[3], parts[7]
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+            out.append((ip, name))
+    return out
+
+
+def _ssdp_linkplay(timeout, found):
+    """SSDP M-SEARCH; keep Linkplay devices (best-effort fallback)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    for _ in range(2):
+        try:
+            sock.sendto(SSDP_SEARCH, ("239.255.255.250", 19190))
+        except OSError:
+            break
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready = select.select([sock], [], [], max(0, deadline - time.monotonic()))
+        if not ready[0]:
+            continue
+        try:
+            data, _ = sock.recvfrom(65535)
+        except OSError:
+            continue
+        text = data.decode("utf-8", "replace")
+        m = re.search(r"^LOCATION:\s*(\S+)", text, re.M | re.I)
+        if not m:
+            continue
+        loc = m.group(1)
+        ip_m = re.search(r"https?://(\d+\.\d+\.\d+\.\d+)", loc)
+        if not ip_m:
+            continue
+        ip = ip_m.group(1)
+        if ip in found:
+            continue
+        try:
+            with urllib.request.urlopen(loc, timeout=2.0,
+                                        context=_SSL_CTX) as resp:
+                desc = resp.read(20000).decode("utf-8", "replace")
+        except Exception:
+            continue
+        if "linkplay" not in desc.lower():
+            continue
+        nm = re.search(r"<friendlyName>([^<]*)</friendlyName>", desc)
+        found[ip] = nm.group(1) if nm else ip
+
+
+def discover(timeout=2.5):
+    """Find WiiM devices; validate each with getStatusEx."""
+    found = {}
+    for ip, name in _avahi_linkplay(timeout):
+        found.setdefault(ip, name)
+    if not found:
+        _ssdp_linkplay(timeout, found)
+
+    devices = []
+    for ip, name in found.items():
+        try:
+            info = Device(ip, timeout=2.0).status_ex()
+            devices.append({
+                "ip": ip,
+                "name": str(info.get("DeviceName") or name or ip),
+                "model": str(info.get("project", "")),
+                "firmware": str(info.get("firmware", "")),
+                "uuid": str(info.get("uuid", "")),
+            })
+        except (WiimError, OfflineError):
+            continue
+    return sorted(devices, key=lambda d: d["name"])
+
+
+# --------------------------------------------------------------------------
+# library (music dir browsing) + file server
+# --------------------------------------------------------------------------
+
+def _is_audio(name):
+    return os.path.splitext(name)[1].lower() in AUDIO_EXTS
+
+
+def _skip(name):
+    return name.startswith(".")
+
+
+def library_scan(root, rel=""):
+    """One level of the music dir: dirs (with audio counts) then tracks."""
+    root = os.path.abspath(os.path.expanduser(root))
+    path = os.path.normpath(os.path.join(root, rel))
+    if not path.startswith(root + os.sep) and path != root:
+        raise WiimError("path escapes the music dir")
+    if not os.path.isdir(path):
+        raise WiimError("not a directory: %s" % rel)
+    dirs, tracks = [], []
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.name.lower())
+    except OSError as e:
+        raise WiimError("cannot read %s: %s" % (rel, e)) from e
+    for e in entries:
+        if _skip(e.name):
+            continue
+        relpath = os.path.relpath(e.path, root)
+        if e.is_dir():
+            count = _count_audio(e.path, depth=2)
+            if count:
+                dirs.append({"name": e.name, "path": relpath, "kind": "dir",
+                             "tracks": count})
+        elif e.is_file() and _is_audio(e.name):
+            tracks.append({"name": os.path.splitext(e.name)[0],
+                           "path": relpath, "kind": "track"})
+    return {"root": root, "rel": rel if rel != "." else "",
+            "dirs": dirs, "tracks": tracks}
+
+
+def _count_audio(path, depth=1):
+    total = 0
+    try:
+        for e in os.scandir(path):
+            if _skip(e.name):
+                continue
+            if e.is_file() and _is_audio(e.name):
+                total += 1
+            elif e.is_dir() and depth > 1:
+                total += _count_audio(e.path, depth - 1)
+            if total > 500:
+                break
+    except OSError:
+        return 0
+    return total
+
+
+def album_tracks(root, rel):
+    root = os.path.abspath(os.path.expanduser(root))
+    path = os.path.normpath(os.path.join(root, rel))
+    if not path.startswith(root + os.sep) and path != root:
+        raise WiimError("path escapes the music dir")
+    if not os.path.isdir(path):
+        raise WiimError("not a directory: %s" % rel)
+    files = []
+    for e in sorted(os.scandir(path), key=lambda e: e.name.lower()):
+        if not _skip(e.name) and e.is_file() and _is_audio(e.name):
+            files.append(os.path.relpath(e.path, root))
+    return files
+
+
+class ServeHandler(http.server.BaseHTTPRequestHandler):
+    """Serves library files by URL: /f/<quoted-relpath> and /pl/<token>.m3u.
+
+    No directory listings over HTTP; traversal-guarded; Range supported.
+    """
+
+    server_version = "wiim/1.0"
+
+    def log_message(self, fmt, *args):  # keep stdout clean for daemon
+        pass
+
+    def _root(self):
+        return self.server.music_root
+
+    def _safe_path(self, rel):
+        root = self._root()
+        path = os.path.normpath(os.path.join(root, rel))
+        if not path.startswith(root + os.sep):
+            return None
+        return path
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/f/"):
+            rel = urllib.parse.unquote(path[3:])
+            file_path = self._safe_path(rel)
+            if not file_path or not os.path.isfile(file_path):
+                self.send_error(404)
+                return
+            self._send_file(file_path)
+        elif path.startswith("/pl/") and path.endswith(".m3u"):
+            token = path[4:-4]
+            entries = self.server.playlists.get(token)
+            if entries is None:
+                self.send_error(404)
+                return
+            base = "/f/"
+            lines = ["#EXTM3U"]
+            for rel in entries:
+                lines.append(base + urllib.parse.quote(rel, safe="/"))
+            body = "\n".join(lines).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/x-mpegurl")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def _send_file(self, file_path):
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            self.send_error(404)
+            return
+        ext = os.path.splitext(file_path)[1].lower()
+        ctype = {
+            ".mp3": "audio/mpeg", ".flac": "audio/flac", ".m4a": "audio/mp4",
+            ".m4b": "audio/mp4", ".aac": "audio/aac", ".ogg": "audio/ogg",
+            ".opus": "audio/opus", ".wav": "audio/wav", ".wma": "audio/x-ms-wma",
+            ".aiff": "audio/aiff", ".aif": "audio/aiff", ".ape": "ape",
+            ".dsf": "audio/x-dsf", ".dff": "audio/x-dff", ".mka": "audio/x-matroska",
+        }.get(ext, "application/octet-stream")
+
+        start, end = 0, size - 1
+        rng = self.headers.get("Range")
+        status = 200
+        if rng:
+            m = re.match(r"bytes=(\d*)-(\d*)", rng)
+            if m:
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                    status = 206
+                elif m.group(2):
+                    start = max(0, size - int(m.group(2)))
+                    status = 206
+        if start > end or start >= size:
+            self.send_error(416)
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if status == 206:
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        try:
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    do_HEAD = do_GET
+
+
+class ServeServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, music_root):
+        super().__init__(addr, ServeHandler)
+        self.music_root = os.path.abspath(os.path.expanduser(music_root))
+        self.playlists = {}
+
+    def make_playlist(self, tracks):
+        token = hashlib.sha1(
+            ("\n".join(tracks) + str(time.time())).encode()).hexdigest()[:12]
+        self.playlists[token] = tracks
+        if len(self.playlists) > 64:  # bounded; oldest-ish eviction
+            for k in list(self.playlists)[:32]:
+                del self.playlists[k]
+        return token
+
+
+def local_ip_for(device_ip):
+    """Which local interface can reach the device (for serve URLs)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((device_ip, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def start_server(port, music_root):
+    srv = ServeServer(("0.0.0.0", port), music_root)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+# --------------------------------------------------------------------------
+# media-key smart router
+# --------------------------------------------------------------------------
+
+MPRIS_ACTIONS = {"playPause": "playPause", "play": "play", "pause": "pause",
+                 "next": "next", "previous": "previous"}
+
+
+def mpris_status():
+    try:
+        out = subprocess_run(["omarchy-shell", "media", "status"])
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def subprocess_run(argv):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            raise WiimError("command failed: %s" % " ".join(argv))
+        return r.stdout.strip()
+    except FileNotFoundError:
+        raise WiimError("omarchy-shell not available") from None
+
+
+def media_route(action, dev, prefer):
+    """Decide WiiM vs MPRIS for a media key, execute, report."""
+    if action not in MPRIS_ACTIONS:
+        raise WiimError("unknown media action: %s" % action)
+
+    wiim_active = False
+    try:
+        p = dev.player_status()
+        status = str(p.get("status", "none"))
+        mode = str(p.get("mode", "0"))
+        src = MODE_TABLE.get(mode, ("none", ""))[0]
+        wiim_active = status in ("play", "pause", "loading") and \
+            (src in STREAM_MODES or src in ("line-in", "bluetooth", "optical"))
+    except (WiimError, OfflineError):
+        wiim_active = False
+
+    target = None
+    if prefer == "wiim":
+        target = "wiim"
+    elif prefer == "mpris":
+        target = "mpris"
+    else:  # auto
+        if wiim_active:
+            target = "wiim"
+        else:
+            ms = mpris_status()
+            if ms and ms.get("playing"):
+                target = "mpris"
+            else:
+                target = "wiim"  # nothing else is playing: WiiM gets the key
+
+    if target == "wiim":
+        if action == "playPause":
+            dev.transport("onepause")
+        elif action == "previous":
+            dev.transport("prev")
+        else:
+            dev.transport(action)
+    else:
+        subprocess_run(["omarchy-shell", "media", MPRIS_ACTIONS[action]])
+    return {"target": target, "action": action, "wiimActive": wiim_active}
+
+
+# --------------------------------------------------------------------------
+# daemon: watch + serve + stdin commands
+# --------------------------------------------------------------------------
+
+def daemon_loop(args):
+    ip = resolve_ip(args)
+    dev = Device(ip, timeout=args.timeout)
+    music_dir = args.dir or load_config(args.config).get(
+        "musicDir", DEFAULT_MUSIC_DIR)
+
+    srv = None
+    serve_info = None
+    if args.port is not None or not args.no_serve:
+        srv = start_server(args.port if args.port else 0, music_dir)
+        serve_info = {"port": srv.server_address[1],
+                      "musicDir": os.path.abspath(os.path.expanduser(music_dir)),
+                      "urlBase": "http://%s:%d" % (local_ip_for(ip),
+                                                   srv.server_address[1])}
+
+    def emit(obj):
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+    emit({"event": "hello", "ip": ip, "serve": serve_info})
+
+    cmds = queue.Queue()
+
+    def stdin_reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                cmds.put(line)
+            if line in ("quit", "exit"):
+                cmds.put(json.dumps({"cmd": "__shutdown__"}))
+                return
+        # stdin closed: shut down
+        cmds.put(json.dumps({"cmd": "__shutdown__"}))
+
+    threading.Thread(target=stdin_reader, daemon=True).start()
+
+    last_sig = None
+    last_full = 0.0
+    snap = None
+    backoff = 1.0
+
+    while True:
+        # drain commands
+        try:
+            while True:
+                line = cmds.get_nowait()
+                try:
+                    req = json.loads(line)
+                except ValueError:
+                    emit({"event": "error", "error": "bad json"})
+                    continue
+                if req.get("cmd") == "__shutdown__":
+                    if srv:
+                        srv.shutdown()
+                    return 0
+                rid = req.get("id")
+                try:
+                    result = handle_daemon_cmd(dev, srv, req, music_dir, ip)
+                    emit({"id": rid, "ok": True, "result": result})
+                except (WiimError, OfflineError) as e:
+                    emit({"id": rid, "ok": False, "error": str(e)})
+                except Exception as e:  # defensive: never die on a command
+                    emit({"id": rid, "ok": False, "error": "internal: %s" % e})
+        except queue.Empty:
+            pass
+
+        # poll device
+        now = time.monotonic()
+        full = (now - last_full) >= FULL_REFRESH_EVERY or snap is None
+        try:
+            snap = snapshot(dev, full=full)
+            backoff = 1.0
+        except (WiimError, OfflineError) as e:
+            emit({"event": "offline", "error": str(e)})
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
+            continue
+
+        if full:
+            last_full = now
+        sig = snapshot_signature(snap)
+        if sig != last_sig:
+            last_sig = sig
+            emit({"event": "state", "snapshot": snap})
+        elif snap["player"]["status"] == "play":
+            # keep the progress bar fresh even when nothing else changed
+            emit({"event": "tick", "curpos": snap["player"]["curpos"],
+                  "totlen": snap["player"]["totlen"]})
+
+        time.sleep(args.interval)
+
+
+def handle_daemon_cmd(dev, srv, req, music_dir, ip):
+    cmd = req.get("cmd", "")
+    a = req.get("args", {}) or {}
+    if cmd == "refresh":
+        return snapshot(dev, full=True)
+    if cmd == "status":
+        return snapshot(dev, full=bool(a.get("full")))
+    if cmd == "toggle":
+        return dev.transport("onepause")
+    if cmd in ("play", "pause", "next", "prev", "stop"):
+        return dev.transport(cmd)
+    if cmd == "seek":
+        return dev.seek(a.get("sec", 0))
+    if cmd == "vol":
+        return dev.set_volume(a.get("value", 0))
+    if cmd == "mute":
+        return dev.set_mute(bool(a.get("on")))
+    if cmd == "loop":
+        return dev.set_loop(a.get("mode", "sequence"))
+    if cmd == "source":
+        return dev.set_source(a.get("id", "wifi"))
+    if cmd == "preset":
+        return dev.preset(a.get("number", 1))
+    if cmd == "eq":
+        return dev.eq_load(a.get("name", "Flat"))
+    if cmd == "eqOn":
+        return dev.eq_on()
+    if cmd == "eqOff":
+        return dev.eq_off()
+    if cmd == "sleep":
+        sec = a.get("sec")
+        return dev.sleep_timer(None if sec in (None, 0, "off") else int(sec))
+    if cmd == "playUrl":
+        return dev.play_url(a.get("url", ""))
+    if cmd == "library":
+        return library_scan(music_dir, a.get("path", ""))
+    if cmd == "playFile":
+        if not srv:
+            raise WiimError("file server not running")
+        rel = a.get("path", "")
+        root = os.path.abspath(os.path.expanduser(music_dir))
+        full = os.path.normpath(os.path.join(root, rel))
+        if not full.startswith(root + os.sep) or not os.path.isfile(full):
+            raise WiimError("not a library file: %s" % rel)
+        url = "%s/f/%s" % (serve_url_base(srv, ip),
+                           urllib.parse.quote(os.path.relpath(full, root)))
+        dev.play_url(url)
+        return {"url": url}
+    if cmd == "playAlbum":
+        if not srv:
+            raise WiimError("file server not running")
+        tracks = album_tracks(music_dir, a.get("path", ""))
+        if not tracks:
+            raise WiimError("no audio files under: %s" % a.get("path", ""))
+        token = srv.make_playlist(tracks)
+        url = "%s/pl/%s.m3u" % (serve_url_base(srv, ip), token)
+        dev.play_playlist(url, int(a.get("index", 0)))
+        return {"url": url, "tracks": len(tracks)}
+    if cmd == "media":
+        return media_route(a.get("action", "playPause"), dev,
+                           a.get("prefer", "auto"))
+    if cmd == "raw":
+        return dev.raw(a.get("command", ""))
+    raise WiimError("unknown cmd: %s" % cmd)
+
+
+def serve_url_base(srv, ip):
+    return "http://%s:%d" % (local_ip_for(ip), srv.server_address[1])
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def out_json(obj):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="wiim", description="WiiM / Linkplay controller (stdlib only)")
+    ap.add_argument("--ip", help="device IP (default: config or discovery)")
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    ap.add_argument("--config", default=CONFIG_PATH_DEFAULT)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("discover", help="find WiiM devices via SSDP")
+    p.add_argument("--timeout", type=float, default=2.5, dest="disc_timeout")
+
+    p = sub.add_parser("status", help="merged snapshot as JSON")
+    p.add_argument("--fast", action="store_true",
+                   help="transport+meta only (fewer requests)")
+
+    p = sub.add_parser("watch", help="JSON-lines change stream")
+    p.add_argument("--interval", type=float, default=POLL_INTERVAL)
+
+    for name in ("play", "pause", "toggle", "next", "prev", "stop"):
+        sub.add_parser(name, help="transport: " + name)
+
+    p = sub.add_parser("seek", help="seek to seconds")
+    p.add_argument("sec", type=int)
+
+    p = sub.add_parser("vol", help="volume: 0-100, +N or -N")
+    p.add_argument("value")
+
+    p = sub.add_parser("mute", help="mute on/off/toggle")
+    p.add_argument("state", choices=["on", "off", "toggle"])
+
+    p = sub.add_parser("source", help="switch input source")
+    p.add_argument("id")
+
+    p = sub.add_parser("preset", help="play preset 1-12")
+    p.add_argument("number", type=int)
+
+    p = sub.add_parser("eq", help="load EQ preset by name")
+    p.add_argument("name")
+    sub.add_parser("eq-on", help="enable EQ")
+    sub.add_parser("eq-off", help="bypass EQ")
+
+    p = sub.add_parser("loop", help="loop mode")
+    p.add_argument("mode", choices=["sequence", "single", "shuffle", "none"])
+
+    p = sub.add_parser("sleep", help="sleep timer: seconds or off")
+    p.add_argument("sec")
+
+    p = sub.add_parser("play-url", help="stream a URL on the device")
+    p.add_argument("url")
+
+    p = sub.add_parser("library", help="browse the music dir (JSON)")
+    p.add_argument("path", nargs="?", default="")
+    p.add_argument("--dir", help="music dir (default: config or ~/Music)")
+
+    p = sub.add_parser("play-file", help="serve + play one library file")
+    p.add_argument("path")
+    p.add_argument("--dir")
+    p.add_argument("--port", type=int, default=0)
+
+    p = sub.add_parser("play-album", help="serve + play an album dir")
+    p.add_argument("path")
+    p.add_argument("--dir")
+    p.add_argument("--port", type=int, default=0)
+
+    p = sub.add_parser("serve", help="run the library file server")
+    p.add_argument("--dir")
+    p.add_argument("--port", type=int, default=0)
+
+    p = sub.add_parser("daemon", help="resident watch+serve+stdin process")
+    p.add_argument("--dir")
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--no-serve", action="store_true")
+    p.add_argument("--interval", type=float, default=POLL_INTERVAL)
+
+    p = sub.add_parser("media", help="media-key router (WiiM vs MPRIS)")
+    p.add_argument("action", choices=["playPause", "play", "pause", "next",
+                                      "previous"])
+    p.add_argument("--prefer", choices=["auto", "wiim", "mpris"],
+                   default="auto")
+
+    p = sub.add_parser("config", help="show or set CLI config")
+    p.add_argument("action", choices=["show", "set"])
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
+
+    p = sub.add_parser("raw", help="raw httpapi command (debug)")
+    p.add_argument("command")
+
+    args = ap.parse_args(argv)
+
+    try:
+        return dispatch(args)
+    except OfflineError as e:
+        out_json({"online": False, "error": str(e)})
+        return 2
+    except WiimError as e:
+        print("wiim: %s" % e, file=sys.stderr)
+        return 1
+
+
+def music_dir_for(args):
+    d = getattr(args, "dir", None)
+    if d:
+        return d
+    return load_config(args.config).get("musicDir", DEFAULT_MUSIC_DIR)
+
+
+def dispatch(args):
+    if args.cmd == "discover":
+        devs = discover(timeout=args.disc_timeout)
+        out_json(devs)
+        return 0 if devs else 2
+
+    if args.cmd == "config":
+        cfg = load_config(args.config)
+        if args.action == "show":
+            cfg["_path"] = args.config
+            out_json(cfg)
+        else:
+            if not args.key:
+                print("wiim: config set needs a key", file=sys.stderr)
+                return 1
+            cfg[args.key] = args.value
+            save_config(args.config, cfg)
+            out_json(cfg)
+        return 0
+
+    if args.cmd == "serve":
+        srv = start_server(args.port, music_dir_for(args))
+        port = srv.server_address[1]
+        print(json.dumps({"port": port,
+                          "musicDir": srv.music_root}))
+        sys.stdout.flush()
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return 0
+
+    if args.cmd == "daemon":
+        return daemon_loop(args)
+
+    if args.cmd == "library":
+        out_json(library_scan(music_dir_for(args), args.path))
+        return 0
+
+    ip = resolve_ip(args)
+    dev = Device(ip, timeout=args.timeout)
+
+    if args.cmd == "status":
+        out_json(snapshot(dev, full=not args.fast))
+        return 0
+    if args.cmd == "watch":
+        last_sig = None
+        last_full = 0.0
+        backoff = 1.0
+        while True:
+            now = time.monotonic()
+            full = (now - last_full) >= FULL_REFRESH_EVERY or last_sig is None
+            try:
+                snap = snapshot(dev, full=full)
+                backoff = 1.0
+            except OfflineError as e:
+                print(json.dumps({"online": False, "error": str(e)}))
+                sys.stdout.flush()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+                last_sig = None
+                continue
+            if full:
+                last_full = now
+            sig = snapshot_signature(snap)
+            if sig != last_sig:
+                last_sig = sig
+                print(json.dumps(snap, separators=(",", ":")))
+                sys.stdout.flush()
+            time.sleep(args.interval)
+
+    if args.cmd in ("play", "pause", "toggle", "next", "prev", "stop"):
+        action = "onepause" if args.cmd == "toggle" else args.cmd
+        if args.cmd == "prev":
+            action = "prev"
+        print(dev.transport(action))
+        return 0
+    if args.cmd == "seek":
+        print(dev.seek(args.sec)); return 0
+    if args.cmd == "vol":
+        if args.value.startswith(("+", "-")):
+            cur = int(dev.player_status().get("vol", 0))
+            print(dev.set_volume(cur + int(args.value)))
+        else:
+            print(dev.set_volume(args.value))
+        return 0
+    if args.cmd == "mute":
+        if args.state == "toggle":
+            on = str(dev.player_status().get("mute", "0")) != "1"
+        else:
+            on = args.state == "on"
+        print(dev.set_mute(on)); return 0
+    if args.cmd == "source":
+        print(dev.set_source(args.id)); return 0
+    if args.cmd == "preset":
+        print(dev.preset(args.number)); return 0
+    if args.cmd == "eq":
+        print(dev.eq_load(args.name)); return 0
+    if args.cmd == "eq-on":
+        print(dev.eq_on()); return 0
+    if args.cmd == "eq-off":
+        print(dev.eq_off()); return 0
+    if args.cmd == "loop":
+        print(dev.set_loop(args.mode)); return 0
+    if args.cmd == "sleep":
+        if args.sec == "off":
+            print(dev.sleep_timer(None))
+        else:
+            print(dev.sleep_timer(int(args.sec)))
+        return 0
+    if args.cmd == "play-url":
+        print(dev.play_url(args.url)); return 0
+
+    if args.cmd in ("play-file", "play-album"):
+        mdir = music_dir_for(args)
+        srv = start_server(args.port, mdir)
+        ip_local = local_ip_for(ip)
+        base = "http://%s:%d" % (ip_local, srv.server_address[1])
+        if args.cmd == "play-file":
+            full = os.path.normpath(os.path.join(srv.music_root, args.path))
+            if not full.startswith(srv.music_root + os.sep) or \
+                    not os.path.isfile(full):
+                raise WiimError("not a library file: %s" % args.path)
+            url = "%s/f/%s" % (base, urllib.parse.quote(
+                os.path.relpath(full, srv.music_root)))
+            dev.play_url(url)
+        else:
+            tracks = album_tracks(mdir, args.path)
+            if not tracks:
+                raise WiimError("no audio files under: %s" % args.path)
+            token = srv.make_playlist(tracks)
+            url = "%s/pl/%s.m3u" % (base, token)
+            dev.play_playlist(url, 0)
+        out_json({"playing": url})
+        # keep the server alive while the device buffers/streams the start
+        time.sleep(10)
+        return 0
+
+    if args.cmd == "media":
+        out_json(media_route(args.action, dev, args.prefer))
+        return 0
+
+    if args.cmd == "raw":
+        print(dev.raw(args.command))
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
