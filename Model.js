@@ -255,7 +255,7 @@ function fixtureSnapshot() {
     device: {
       name: "Play Room Speakers", model: "WiiM Pro Receiver",
       firmware: "Linkplay.4.8.827634", uuid: "FIXTURE", mac: "40:D9:5A:30:39:3C",
-      ip: "192.168.183.8", group: "0", presetKeys: 12, internet: true
+      ip: "192.168.1.50", group: "0", presetKeys: 12, internet: true
     },
     presets: [
       { number: 1, name: "Radio Paradise", source: "RadioParadise", picurl: "" },

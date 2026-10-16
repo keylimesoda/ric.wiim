@@ -5,7 +5,7 @@ keyboard-driven control panel, backed by a stdlib-only Python CLI/daemon.
 
 ## Decisions (settled with the user, 2026-10-16)
 
-- Target device: **WiiM Pro Receiver "Play Room Speakers" @ 192.168.183.8**
+- Target device: **WiiM Pro Receiver "Play Room Speakers" @ 192.168.1.50 (LAN)**
   (pinned as default; `--ip` + SSDP discovery supported for the future).
 - **No global keybinding** by default; README documents how to bind
   `omarchy-shell shell toggle ric.wiim`.

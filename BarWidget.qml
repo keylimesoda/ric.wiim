@@ -31,7 +31,7 @@ Panel {
     return url.replace(/\/+$/, "")
   }
   readonly property string bin: pluginDir + "/bin/wiim"
-  readonly property string deviceIp: String(setting("deviceIp", "192.168.183.8"))
+  readonly property string deviceIp: String(setting("deviceIp", ""))
   readonly property string musicDir: String(setting("musicDir", "~/Music"))
   readonly property int volStep: Math.max(1, Math.min(20, Number(setting("volStep", 5)) || 5))
   readonly property int pollMs: Math.max(200, Math.min(2000, Number(setting("pollMs", 500)) || 500))
@@ -352,9 +352,11 @@ Panel {
 
   Process {
     id: daemonProc
-    command: [root.bin, "--ip", root.deviceIp, "daemon",
-              "--dir", root.musicDir,
-              "--interval", String(root.pollMs / 1000)]
+    command: (root.deviceIp
+              ? [root.bin, "--ip", root.deviceIp]
+              : [root.bin]).concat(
+              ["daemon", "--dir", root.musicDir,
+               "--interval", String(root.pollMs / 1000)])
     running: !root.fixtureMode
     stdinEnabled: true
 
@@ -1163,7 +1165,8 @@ Panel {
             }
             InfoPair {
               label: "Address"
-              value: root.deviceIp + (root.online ? "" : "  (offline)")
+              value: (root.online && root.snap.device ? root.snap.device.ip
+                      : root.deviceIp) + (root.online ? "" : "  (offline)")
             }
             InfoPair {
               label: "Queue"

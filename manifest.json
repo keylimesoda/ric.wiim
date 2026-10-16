@@ -18,7 +18,7 @@
     "allowMultiple": false,
     "defaultSection": "center",
     "defaults": {
-      "deviceIp": "192.168.183.8",
+      "deviceIp": "",
       "musicDir": "~/Music",
       "volStep": 5,
       "pollMs": 500,
@@ -31,7 +31,7 @@
         "type": "string",
         "label": "Device IP",
         "description": "WiiM device address (find it with: wiim discover). Empty = auto-discover at startup.",
-        "defaultValue": "192.168.183.8"
+        "defaultValue": ""
       },
       {
         "key": "musicDir",
