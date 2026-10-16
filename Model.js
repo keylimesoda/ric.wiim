@@ -59,7 +59,7 @@ var LOOP_LABEL = {
 }
 
 var STATUS_LABEL = {
-  play: "Playing", pause: "Paused", loading: "Buffering",
+  play: "Playing", pause: "Paused", load: "Buffering", loading: "Buffering",
   stop: "Stopped", none: "Idle"
 }
 
@@ -96,7 +96,7 @@ function chipState(snap, daemonReady) {
   if (!snap) return daemonReady ? "idle" : "offline"
   if (!snap.online) return "offline"
   var st = snap.player ? snap.player.status : "none"
-  if (st === "play" || st === "loading") return "playing"
+  if (st === "play" || st === "load" || st === "loading") return "playing"
   if (st === "pause") return "paused"
   return "idle"
 }
@@ -264,7 +264,7 @@ function fixtureSnapshot() {
     ],
     eq: { stat: "On", list: ["Flat", "Bass Booster", "Classical", "Deep",
                              "Jazz", "Movie", "Pop", "Rock", "Vocal Booster"] },
-    output: { hardware: "Coax out" },
+    output: { hardware: "Line out", fixedVol: false },
     sleep: { sec: 0 },
     sources: [
       { id: "wifi", label: "Wi-Fi", active: false },

@@ -165,12 +165,18 @@ Panel {
   // ---- derived state --------------------------------------------------------
   readonly property bool online: snap !== null && snap.online === true
   readonly property string status: online ? snap.player.status : "none"
-  readonly property bool playing: status === "play" || status === "loading"
+  readonly property bool playing: status === "play" || status === "load" || status === "loading"
   readonly property bool paused: status === "pause"
   readonly property bool hasTrack: online && snap.meta && snap.meta.title !== ""
   readonly property int vol: online ? snap.player.vol : 0
   readonly property bool muted: online && snap.player.mute
+  readonly property bool fixedVol: online && snap.output && snap.output.fixedVol === true
   readonly property string chipState: Model.chipState(snap, daemonReady || fixtureMode)
+
+  // stall detection: a stream stuck in "load" usually means the device
+  // cannot reach the music server (e.g. AP client isolation).
+  property real loadAtMs: 0
+  property bool loadStalled: false
 
   // ---- actions --------------------------------------------------------------
   function sendCmd(cmd, args) {
@@ -260,7 +266,7 @@ Panel {
     sendCmd("eq", { name: next })
   }
   function eqCurrent() {
-    if (!online || snap.eq.stat !== "On") return "__off"
+    if (!online || !snap.eq || snap.eq.stat !== "On") return "__off"
     // the firmware reports the loaded EQ only via getPlayerStatus.eq index
     var li = snap.eq.list || []
     var pi = Number(snap.player.eqIndex)
@@ -279,7 +285,7 @@ Panel {
     else sendCmd("sleep", { sec: 0 })
   }
   function sleepCycle() {
-    var cur = online ? snap.sleep.sec : 0
+    var cur = online && snap.sleep ? snap.sleep.sec : 0
     sleepSet(Model.nextSleep(cur))
   }
 
@@ -326,6 +332,9 @@ Panel {
           libRows = Model.libraryRows(obj.result)
           libLoaded = true
           if (idx("library") >= libRows.length) setIdx("library", 0)
+        } else if (!obj.ok && kind === "library") {
+          libRows = []
+          libLoaded = true
         }
       }
       if (obj.ok === false && obj.error) lastError = String(obj.error)
@@ -343,7 +352,7 @@ Panel {
 
   Process {
     id: daemonProc
-    command: [root.bin, "daemon", "--ip", root.deviceIp,
+    command: [root.bin, "--ip", root.deviceIp, "daemon",
               "--dir", root.musicDir,
               "--interval", String(root.pollMs / 1000)]
     running: !root.fixtureMode
@@ -385,8 +394,16 @@ Panel {
   Timer {
     interval: 250
     repeat: true
-    running: root.online && (root.playing || (root.online && root.snap.sleep.sec > 0))
+    running: root.online && (root.playing ||
+           (root.snap.sleep !== undefined && root.snap.sleep.sec > 0))
     onTriggered: {
+      if (root.status === "load") {
+        if (root.loadAtMs === 0) root.loadAtMs = Date.now()
+        else if (Date.now() - root.loadAtMs > 10000) root.loadStalled = true
+      } else {
+        root.loadAtMs = 0
+        root.loadStalled = false
+      }
       if (root.playing) {
         root.curposLocal += 250
         if (root.curposTotal > 0 && root.curposLocal > root.curposTotal)
@@ -544,6 +561,15 @@ Panel {
     }
 
     // debug surface (mirrors ric.daikin conventions)
+    function chipInfo(): string {
+      return JSON.stringify({
+        chipImplicit: chip.implicitWidth, chipW: chip.width,
+        rowImplicit: barTextRow.implicitWidth, markImplicit: mark0.implicitWidth,
+        markW: mark0.width, canvas: Style.bar.iconCanvas,
+        rootImplicit: root.implicitWidth, visible: root.visible
+      })
+    }
+
     function dumpState(): string {
       return JSON.stringify({
         online: root.online, status: root.status, daemonRunning: daemonProc.running,
@@ -570,10 +596,12 @@ Panel {
       spacing: Style.space(6)
 
       EqMark {
+        id: mark0
         anchors.verticalCenter: parent.verticalCenter
         size: Style.bar.iconCanvas
         ink: root.chipInk
         animating: root.chipState === "playing"
+        showSpeaker: root.chipState === "offline"
       }
 
       // Now-playing text: glides when it does not fit (brumm-style), else
@@ -583,6 +611,8 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         width: Math.min(Style.space(170), barLabel.implicitWidth)
         height: barLabel.height
+        implicitWidth: visible ? width : 0
+        implicitHeight: height
         visible: root.barText && !root.vertical && barLabel.text !== ""
         clip: true
 
@@ -622,7 +652,8 @@ Panel {
         else root.toggle()
       }
       onWheel: function (wheel) {
-        root.volStepBy(wheel.angleDelta.y > 0 ? root.volStep : -root.volStep)
+        if (!root.fixedVol)
+          root.volStepBy(wheel.angleDelta.y > 0 ? root.volStep : -root.volStep)
       }
       onEntered: if (root.bar) root.bar.showTooltip(chip, Model.tooltipText(root.snap))
       onExited: if (root.bar) root.bar.hideTooltip(chip)
@@ -630,9 +661,9 @@ Panel {
   }
 
   readonly property color chipInk:
-    root.chipState === "offline" ? Qt.alpha(root.fg, 0.30)
-    : root.chipState === "idle" ? Qt.alpha(root.fg, 0.50)
-    : root.chipState === "paused" ? Qt.alpha(root.fg, 0.70)
+    root.chipState === "offline" ? Qt.alpha(root.fg, 0.35)
+    : root.chipState === "idle" ? Qt.alpha(root.fg, 0.70)
+    : root.chipState === "paused" ? Qt.alpha(root.fg, 0.85)
     : root.fg
 
   // ---- panel ---------------------------------------------------------------------
@@ -818,8 +849,21 @@ Panel {
               onHovered: function (h) { if (h) root.setCursor("volume", 0) }
             }
 
+            Text {
+              id: volFixedHint
+              anchors.verticalCenter: parent.verticalCenter
+              visible: root.fixedVol
+              textFormat: Text.PlainText
+              text: "fixed level (digital out) — control at the amp"
+              color: root.fg
+              opacity: 0.5
+              font.family: root.ff
+              font.pixelSize: Style.font.caption
+            }
+
             Rectangle {
               id: volFrame
+              visible: !root.fixedVol
               width: Math.max(40, parent.width - muteBtn.width - volReadout.implicitWidth
                               - parent.spacing * 2)
               height: root.controlH
@@ -844,6 +888,7 @@ Panel {
             Text {
               id: volReadout
               anchors.verticalCenter: parent.verticalCenter
+              visible: !root.fixedVol
               textFormat: Text.PlainText
               text: root.online ? String(root.vol) : "—"
               color: root.fg
@@ -934,7 +979,7 @@ Panel {
 
               ToggleSwitch {
                 anchors.verticalCenter: parent.verticalCenter
-                checked: root.online && root.snap.eq.stat === "On"
+                checked: root.online && root.snap.eq && root.snap.eq.stat === "On"
                 interactive: root.online
                 foreground: root.fg
                 onToggled: { checked ? root.eqSet(root.eqShown === "__off" ? "Flat" : root.eqShown)
@@ -948,7 +993,7 @@ Panel {
                 label: ""
                 showLabel: false
                 value: root.eqCurrent()
-                options: Model.eqOptions(root.snap ? root.snap.eq.list : [])
+                options: Model.eqOptions(root.snap && root.snap.eq ? root.snap.eq.list : [])
                 foreground: root.fg
                 background: Color.popups.background
                 fontFamily: root.ff
@@ -1009,7 +1054,7 @@ Panel {
             ButtonGroup {
               width: parent.width
               options: Model.sleepOptions()
-              value: root.online ? String(root.snap.sleep.sec) : "0"
+              value: root.online && root.snap.sleep ? String(root.snap.sleep.sec) : "0"
               foreground: root.fg
               fontFamily: root.ff
               cursorIndex: root.cursorActive && root.focusSection === "sleep"
@@ -1129,6 +1174,17 @@ Panel {
 
             Text {
               width: parent.width
+              visible: root.loadStalled
+              text: "Stream not starting — device cannot reach the music server (AP client isolation?)"
+              color: Color.urgent
+              opacity: 0.9
+              font.family: root.ff
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
               visible: root.lastError !== ""
               text: root.lastError
               color: Color.urgent
@@ -1213,13 +1269,16 @@ Panel {
         anchors.margins: Style.space(2)
         fillMode: Image.PreserveAspectCrop
         asynchronous: true
-        source: root.online && root.snap.meta ? root.snap.meta.artUrl : ""
+        source: root.online && root.snap.meta &&
+                String(root.snap.meta.artUrl).indexOf("http") === 0
+                ? root.snap.meta.artUrl : ""
         visible: source !== "" && root.online
       }
 
       Text {
         anchors.centerIn: parent
-        visible: !(root.online && root.snap.meta && root.snap.meta.artUrl)
+        visible: !(root.online && root.snap.meta &&
+                   String(root.snap.meta.artUrl).indexOf("http") === 0)
         text: root.hasTrack ? Model.ICON.nowplaying : Model.ICON.speaker
         color: root.fg
         opacity: root.hasTrack ? 0.9 : 0.5
@@ -1229,50 +1288,70 @@ Panel {
     }
   }
 
-  // Bar-sized equalizer mark: three bars, alive while playing.
+  // Bar-sized equalizer mark: three bars, alive while playing; a speaker
+  // glyph when the device is offline.
   component EqMark: Item {
     id: mark
     property real size: Style.bar.iconCanvas
     property color ink: root.fg
     property bool animating: false
+    property bool showSpeaker: false
 
     width: size
     height: size
+    implicitWidth: size
+    implicitHeight: size
 
-    property real bw: Math.max(2, Math.round(size * 0.16))
-    property real gap: Math.max(2, Math.round(size * 0.14))
-    property real totalW: bw * 3 + gap * 2
-    property real h0: animating ? size * 0.55 : size * 0.40
-    property real h1: animating ? size * 0.85 : size * 0.62
-    property real h2: animating ? size * 0.50 : size * 0.40
+    property real h0: animating ? size * 0.55 : size * 0.45
+    property real h1: animating ? size * 0.85 : size * 0.70
+    property real h2: animating ? size * 0.50 : size * 0.45
 
-    Timer {
-      interval: 260
-      repeat: true
-      running: mark.animating
-      onTriggered: {
-        mark.h0 = mark.size * (0.30 + Math.random() * 0.40)
-        mark.h1 = mark.size * (0.55 + Math.random() * 0.40)
-        mark.h2 = mark.size * (0.30 + Math.random() * 0.40)
-      }
+    Text {
+      anchors.centerIn: parent
+      visible: mark.showSpeaker
+      text: Model.ICON.speaker
+      color: mark.ink
+      font.family: root.ff
+      font.pixelSize: mark.size * 0.9
     }
 
-    Repeater {
-      model: 3
-      delegate: Rectangle {
-        required property int index
-        width: mark.bw
-        radius: Math.max(1, mark.bw / 2)
-        color: mark.ink
-        x: (mark.width - mark.totalW) / 2 + index * (mark.bw + mark.gap)
-        y: mark.height - height
-        height: index === 0 ? mark.h0 : index === 1 ? mark.h1 : mark.h2
+    Item {
+      id: inner
+      anchors.fill: parent
+      visible: !mark.showSpeaker
 
-        Behavior on height {
-          enabled: mark.animating
-          NumberAnimation { duration: 240; easing.type: Easing.OutCubic }
+      property real bw: Math.max(2, Math.round(size * 0.16))
+      property real gap: Math.max(2, Math.round(size * 0.14))
+      property real totalW: bw * 3 + gap * 2
+
+      Timer {
+        interval: 260
+        repeat: true
+        running: mark.animating
+        onTriggered: {
+          mark.h0 = mark.size * (0.30 + Math.random() * 0.40)
+          mark.h1 = mark.size * (0.55 + Math.random() * 0.40)
+          mark.h2 = mark.size * (0.30 + Math.random() * 0.40)
         }
-        Behavior on color { ColorAnimation { duration: 200 } }
+      }
+
+      Repeater {
+        model: [0, 1, 2]
+        delegate: Rectangle {
+          required property int modelData
+          width: inner.bw
+          radius: Math.max(1, inner.bw / 2)
+          color: mark.ink
+          x: (mark.width - inner.totalW) / 2 + modelData * (inner.bw + inner.gap)
+          y: mark.height - height
+          height: modelData === 0 ? mark.h0 : modelData === 1 ? mark.h1 : mark.h2
+
+          Behavior on height {
+            enabled: mark.animating
+            NumberAnimation { duration: 240; easing.type: Easing.OutCubic }
+          }
+          Behavior on color { ColorAnimation { duration: 200 } }
+        }
       }
     }
   }

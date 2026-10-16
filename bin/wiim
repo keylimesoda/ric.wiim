@@ -410,12 +410,12 @@ def normalize_meta(meta, player):
         title = hex_decode(player.get("Title", ""))
         artist = artist or hex_decode(player.get("Artist", ""))
         album = album or hex_decode(player.get("Album", ""))
-    if title == "Unknown":
-        title = ""
-    if artist == "Unknown":
-        artist = ""
-    if album == "Unknown":
-        album = ""
+    # Firmware placeholders for "no metadata" (the device spells it
+    # "unknow"/"un_known" depending on the field).
+    def clean(v):
+        return "" if v.strip().lower().replace("_", "") in ("", "unknown", "unknow", "none") else v
+    title, artist, album = clean(title), clean(artist), clean(album)
+    art, rate, depth = clean(art), clean(rate), clean(depth)
     return {"title": title, "artist": artist, "album": album,
             "artUrl": art, "sampleRate": rate, "bitDepth": depth}
 
@@ -496,7 +496,7 @@ def snapshot(dev, full=True):
     snap["device"] = {
         "name": str(info.get("DeviceName") or info.get("ssid") or
                     info.get("GroupName") or dev.ip),
-        "model": str(info.get("project", "")),
+        "model": str(info.get("project", "")).replace("_", " "),
         "firmware": str(info.get("firmware", "")),
         "uuid": str(info.get("uuid", "")),
         "mac": str(info.get("MAC", "")),
@@ -510,8 +510,12 @@ def snapshot(dev, full=True):
         "stat": eq_stat or "unknown",
         "list": eqlist,
     }
+    hw = str(out_mode.get("hardware", ""))
     snap["output"] = {
-        "hardware": OUTPUT_HW.get(str(out_mode.get("hardware", "")), ""),
+        "hardware": OUTPUT_HW.get(hw, ""),
+        # Digital outputs (optical/coax) pass a fixed line level; volume
+        # writes are accepted but ignored (verified on WiiM Pro coax).
+        "fixedVol": hw in ("1", "3"),
     }
     snap["sleep"] = {"sec": shut if shut is not None else 0}
     snap["sources"] = build_sources(cap, en, ren, snap["player"]["source"])
@@ -641,7 +645,7 @@ def discover(timeout=2.5):
             devices.append({
                 "ip": ip,
                 "name": str(info.get("DeviceName") or name or ip),
-                "model": str(info.get("project", "")),
+                "model": str(info.get("project", "")).replace("_", " "),
                 "firmware": str(info.get("firmware", "")),
                 "uuid": str(info.get("uuid", "")),
             })
@@ -669,7 +673,7 @@ def library_scan(root, rel=""):
     if not path.startswith(root + os.sep) and path != root:
         raise WiimError("path escapes the music dir")
     if not os.path.isdir(path):
-        raise WiimError("not a directory: %s" % rel)
+        raise WiimError("not a directory: %s" % path)
     dirs, tracks = [], []
     try:
         entries = sorted(os.scandir(path), key=lambda e: e.name.lower())
@@ -714,7 +718,7 @@ def album_tracks(root, rel):
     if not path.startswith(root + os.sep) and path != root:
         raise WiimError("path escapes the music dir")
     if not os.path.isdir(path):
-        raise WiimError("not a directory: %s" % rel)
+        raise WiimError("not a directory: %s" % path)
     files = []
     for e in sorted(os.scandir(path), key=lambda e: e.name.lower()):
         if not _skip(e.name) and e.is_file() and _is_audio(e.name):
@@ -902,7 +906,7 @@ def media_route(action, dev, prefer):
         status = str(p.get("status", "none"))
         mode = str(p.get("mode", "0"))
         src = MODE_TABLE.get(mode, ("none", ""))[0]
-        wiim_active = status in ("play", "pause", "loading") and \
+        wiim_active = status in ("play", "pause", "load", "loading") and \
             (src in STREAM_MODES or src in ("line-in", "bluetooth", "optical"))
     except (WiimError, OfflineError):
         wiim_active = False
@@ -977,6 +981,7 @@ def daemon_loop(args):
     last_sig = None
     last_full = 0.0
     snap = None
+    last_full_snap = None
     backoff = 1.0
 
     while True:
@@ -1009,6 +1014,15 @@ def daemon_loop(args):
         full = (now - last_full) >= FULL_REFRESH_EVERY or snap is None
         try:
             snap = snapshot(dev, full=full)
+            if full:
+                last_full_snap = snap
+            elif last_full_snap is not None:
+                # Fast polls only carry player/meta; merge them into the
+                # last full snapshot so consumers always see complete state.
+                merged = dict(last_full_snap)
+                for key in ("online", "ts", "player", "meta"):
+                    merged[key] = snap[key]
+                snap = merged
             backoff = 1.0
         except (WiimError, OfflineError) as e:
             emit({"event": "offline", "error": str(e)})
