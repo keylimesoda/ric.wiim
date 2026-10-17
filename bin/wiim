@@ -1157,11 +1157,16 @@ def daemon_loop(args):
     srv = None
     serve_info = None
     if args.port is not None or not args.no_serve:
-        srv = start_server(args.port if args.port else 0, music_dir)
-        serve_info = {"port": srv.server_address[1],
-                      "musicDir": os.path.abspath(os.path.expanduser(music_dir)),
-                      "urlBase": "http://%s:%d" % (local_ip_for(ip),
-                                                   srv.server_address[1])}
+        try:
+            srv = start_server(args.port if args.port else 0, music_dir)
+            serve_info = {"port": srv.server_address[1],
+                          "musicDir": os.path.abspath(os.path.expanduser(music_dir)),
+                          "urlBase": "http://%s:%d" % (local_ip_for(ip),
+                                                       srv.server_address[1])}
+        except OSError as e:
+            # Port busy (another instance, or a foreign service): keep
+            # watching, skip serving; local playback reports via serve=None.
+            sys.stderr.write("serve disabled: %s\n" % e)
 
     def emit(obj):
         sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")

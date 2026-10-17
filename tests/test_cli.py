@@ -177,7 +177,8 @@ class TestDaemon(CliTestCase):
         env = dict(os.environ, WIIM_BASE=self.srv.base)
         proc = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "bin", "wiim"),
-             "--ip", "127.0.0.1", "daemon", "--interval", "0.1"],
+             "--ip", "127.0.0.1", "daemon", "--interval", "0.1",
+             "--port", "0"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
 
         def read_event():
