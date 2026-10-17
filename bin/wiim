@@ -753,11 +753,26 @@ class ServeHandler(http.server.BaseHTTPRequestHandler):
         return self.server.music_root
 
     def _safe_path(self, rel):
+        # Contain within the music dir after symlink resolution: a symlink
+        # inside the dir must not expose targets outside it.
         root = self._root()
         path = os.path.normpath(os.path.join(root, rel))
         if not path.startswith(root + os.sep):
             return None
+        real_root = os.path.realpath(root)
+        real = os.path.realpath(path)
+        if real != real_root and not real.startswith(real_root + os.sep):
+            return None
         return path
+
+    def _allowed(self, file_path):
+        # Same filtering the library browser applies: no dotfiles at any
+        # level, audio extensions only. Enforced here, not just upstream.
+        rel = os.path.relpath(file_path, self._root())
+        for part in rel.split(os.sep):
+            if _skip(part):
+                return False
+        return _is_audio(os.path.basename(file_path))
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -765,7 +780,8 @@ class ServeHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/f/"):
             rel = urllib.parse.unquote(path[3:])
             file_path = self._safe_path(rel)
-            if not file_path or not os.path.isfile(file_path):
+            if not file_path or not os.path.isfile(file_path) \
+                    or not self._allowed(file_path):
                 self.send_error(404)
                 return
             self._send_file(file_path)

@@ -298,6 +298,56 @@ class TestServe(CliTestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 404)
 
+    def test_non_audio_404(self):
+        with open(os.path.join(self.tmp, "notes.txt"), "wb") as f:
+            f.write(b"private")
+        try:
+            self._get("/f/notes.txt")
+            self.fail("expected 404")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)
+
+    def test_hidden_file_404(self):
+        with open(os.path.join(self.tmp, ".hidden.mp3"), "wb") as f:
+            f.write(self.payload)
+        try:
+            self._get("/f/.hidden.mp3")
+            self.fail("expected 404")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)
+
+    def test_hidden_dir_404(self):
+        os.makedirs(os.path.join(self.tmp, ".secretdir"))
+        with open(os.path.join(self.tmp, ".secretdir", "ok.mp3"), "wb") as f:
+            f.write(self.payload)
+        try:
+            self._get("/f/.secretdir/ok.mp3")
+            self.fail("expected 404")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)
+
+    def test_symlink_escape_404(self):
+        outside = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        outside.write(b"outside-secret")
+        outside.close()
+        try:
+            os.symlink(outside.name, os.path.join(self.tmp, "link.mp3"))
+            try:
+                self._get("/f/link.mp3")
+                self.fail("expected 404")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 404)
+        finally:
+            os.unlink(outside.name)
+
+    def test_nested_audio_ok(self):
+        os.makedirs(os.path.join(self.tmp, "Artist/Album"))
+        with open(os.path.join(self.tmp, "Artist/Album/t.mp3"), "wb") as f:
+            f.write(self.payload)
+        status, body = self._get("/f/Artist/Album/t.mp3")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.payload)
+
     def test_no_listings(self):
         try:
             self._get("/")
