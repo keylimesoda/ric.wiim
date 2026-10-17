@@ -101,9 +101,16 @@ function chipState(snap, daemonReady) {
   return "idle"
 }
 
+function trackTitle(snap) {
+  var t = snap && snap.meta && snap.meta.title ? snap.meta.title : ""
+  // The live capture endpoint is a stream, so the player reports its URL
+  // as a track title. Keep the transport URL out of the visible song label.
+  return /^https?:\/\/[^/]+\/live\.wav(?:[?#].*)?$/.test(t) ? "Local audio" : t
+}
+
 function heroTitle(snap) {
   if (!snap || !snap.online) return "WiiM"
-  var t = snap.meta && snap.meta.title ? snap.meta.title : ""
+  var t = trackTitle(snap)
   if (t) return t
   return STATUS_LABEL[snap.player.status] || "Idle"
 }
@@ -119,8 +126,9 @@ function heroMeta(snap) {
 
 function barLabel(snap) {
   if (!snap || !snap.online) return ""
-  var t = snap.meta && snap.meta.title ? snap.meta.title : ""
+  var t = trackTitle(snap)
   if (!t) return ""
+  if (t === "Local audio") return t
   var a = snap.meta && snap.meta.artist ? snap.meta.artist : ""
   return a ? t + "  ·  " + a : t
 }
@@ -136,7 +144,7 @@ function tooltipText(snap) {
   var bits = [snap.device ? snap.device.name : "WiiM",
               STATUS_LABEL[p.status] || p.status,
               p.sourceLabel, "vol " + p.vol]
-  if (snap.meta && snap.meta.title) bits.unshift(snap.meta.title)
+  if (trackTitle(snap)) bits.unshift(trackTitle(snap))
   return bits.join(" · ")
 }
 

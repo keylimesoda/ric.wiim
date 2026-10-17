@@ -12,6 +12,7 @@ fi
 ( cd "$root" && python3 -m unittest discover -s tests )
 if command -v node >/dev/null 2>&1; then
   node "$root/tests/test_model.js"
+  node "$root/tests/test_audio_flow.js"
 else
   printf 'node not found: skipping Model.js unit tests\n'
 fi

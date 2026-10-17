@@ -5,6 +5,7 @@ import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import "Model.js" as Model
+import "AudioFlow.js" as AudioFlow
 
 // ric.wiim — WiiM controller in the Omarchy bar.
 //
@@ -160,7 +161,12 @@ Panel {
         break
       }
       case "library": libraryActivate(idx("library")); break
-      case "device": refresh(); break
+      case "device":
+        if (audioFlow.phase === "failed") setLocalout(true)
+        else if (localoutNeedsTools) requestSetup("tools")
+        else if (localoutNeedsNetworkHelp) requestSetup("firewall")
+        else refresh()
+        break
     }
   }
 
@@ -310,6 +316,7 @@ Panel {
 
   // ---- daemon -----------------------------------------------------------------
   function handleLine(text) {
+    if (root.fixtureMode) return
     var obj = Model.parseLine(text)
     if (!obj) return
     if (obj.event === "hello") {
@@ -361,6 +368,7 @@ Panel {
                "--interval", String(root.pollMs / 1000)])
     running: !root.fixtureMode
     stdinEnabled: true
+    onStarted: if (root.fixtureMode) daemonProc.signal(15)
 
     stdout: SplitParser {
       splitMarker: "\n"
@@ -394,31 +402,252 @@ Panel {
     Qt.callLater(function () { daemonProc.running = true })
   }
 
-  // ---- local audio out (experimental) --------------------------------------
-  // `wiim localout` owns the whole lifecycle: creates the PipeWire sink,
-  // streams it to the WiiM, and restores everything when the process ends.
-  // Stopping the process (toggle off, widget unload) triggers its teardown.
-  property bool localoutOn: false
+  // One request owns checking, setup, connection, playback, and cancellation.
+  property var audioFlow: AudioFlow.initial()
+  readonly property bool localoutOn: audioFlow.wanted
+  readonly property string localoutError: audioFlow.error
+  readonly property bool localoutNeedsTools: audioFlow.phase === "needs-tools"
+  readonly property bool localoutNeedsNetworkHelp: audioFlow.phase === "needs-firewall"
+  readonly property bool audioPending: AudioFlow.pending(audioFlow)
+  property bool localoutCanInstall: false
+  property bool localoutCanSetupFirewall: false
+  property string checkedAudioFirewall: "unknown"
+  property string localoutFirewallIp: ""
+  property string setupKind: ""
+  property string setupPlayerIp: ""
+  property int setupPort: 7402
+  property string lastAudioNotification: ""
+  property string audioNotificationText: ""
 
-  Process {
-    id: localoutProc
-    command: (root.deviceIp
-              ? [root.bin, "--ip", root.deviceIp]
-              : [root.bin]).concat(
-              ["localout", "--port", String(root.localoutPort)])
-    running: false
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: root.localoutOn = false
+  function audioEvent(event) {
+    audioFlow = AudioFlow.reduce(audioFlow, event)
+    if (!AudioFlow.needsAttention(audioFlow)) dismissAudioNotification()
+    var effects = audioFlow.effects
+    for (var i = 0; i < effects.length; i++) {
+      switch (effects[i]) {
+        case "check": beginAudioCheck(); break
+        case "start": beginAudioStream(); break
+        case "stop": stopAudioAttempt(); break
+        case "authorize": beginAudioAuthorization(); break
+        case "attention": notifyAudioAttention(); break
+      }
+    }
+  }
+
+  function audioFailure(message, generation) {
+    audioEvent({ type: "failed", generation: generation, message: message })
   }
 
   function setLocalout(on) {
     if (root.fixtureMode) return
-    if (on && !root.online) {
-      root.lastError = "no WiiM reachable — local audio out needs the speaker online"
-      return
+    if (on && (!online || localoutProc.running || nativeSetupProc.running || audioFlow.phase === "stopping")) return
+    if (on) {
+      localoutFirewallIp = snap && snap.device ? String(snap.device.ip || deviceIp) : deviceIp
+      audioEvent({ type: "enable" })
+    } else {
+      setupConfirm.opened = false
+      audioEvent({ type: "disable" })
     }
-    root.localoutOn = on
-    localoutProc.running = on
+  }
+
+  function beginAudioCheck() {
+    if (!audioFlow.wanted || audioFlow.phase !== "checking") return
+    if (audioCheckProc.running || nativeSetupProc.running) return
+    audioCheckProc.attempt = audioFlow.generation
+    audioCheckProc.handled = false
+    audioCheckProc.running = true
+    audioCheckDeadline.restart()
+  }
+
+  function beginAudioStream() {
+    if (!audioFlow.wanted || audioFlow.phase !== "connecting" || localoutProc.running) return
+    localoutProc.attempt = audioFlow.generation
+    localoutProc.failureText = ""
+    localoutProc.running = true
+  }
+
+  function stopAudioAttempt() {
+    audioCheckDeadline.stop()
+    if (audioCheckProc.running) audioCheckProc.signal(15)
+    if (localoutProc.running) localoutProc.signal(15)
+    finishAudioStop()
+  }
+
+  function finishAudioStop() {
+    if (audioFlow.phase === "stopping" && !localoutProc.running && !nativeSetupProc.running && !audioCheckProc.running)
+      audioEvent({ type: "stopped" })
+  }
+
+  function requestSetup(kind) {
+    if (!audioFlow.wanted || nativeSetupProc.running) return
+    setupKind = kind
+    setupPlayerIp = localoutFirewallIp
+    setupPort = localoutPort
+    setupConfirm.selectedIndex = 0
+    setupConfirm.opened = true
+  }
+
+  function applySetup() {
+    setupConfirm.opened = false
+    audioEvent({ type: "authorize", generation: audioFlow.generation })
+  }
+
+  function beginAudioAuthorization() {
+    if (!audioFlow.wanted || audioFlow.phase !== "authorizing" || localoutProc.running || nativeSetupProc.running) return
+    nativeSetupProc.attempt = audioFlow.generation
+    nativeSetupProc.result = null
+    nativeSetupProc.failureText = ""
+    nativeSetupProc.running = true
+  }
+
+  Timer {
+    id: audioCheckDeadline
+    interval: 3000
+    onTriggered: {
+      if (root.audioFlow.phase !== "checking") return
+      root.audioFailure("Checking audio setup took too long. Please retry.", audioCheckProc.attempt)
+      if (audioCheckProc.running) audioCheckProc.signal(15)
+    }
+  }
+
+  Process {
+    id: audioCheckProc
+    property int attempt: 0
+    property bool handled: false
+    onStarted: if (!root.audioFlow.wanted || attempt !== root.audioFlow.generation) signal(15)
+    command: [root.bin, "--ip", root.localoutFirewallIp, "audio-check", "--port", String(root.localoutPort)]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        audioCheckDeadline.stop()
+        if (root.fixtureMode || audioCheckProc.attempt !== root.audioFlow.generation || !root.audioFlow.wanted) return
+        try {
+          var check = JSON.parse(text)
+          if (typeof check.ready !== "boolean") throw new Error("invalid check")
+          audioCheckProc.handled = true
+          root.localoutCanInstall = check.canInstall === true
+          root.localoutCanSetupFirewall = check.canSetupFirewall === true
+          root.checkedAudioFirewall = String(check.firewall || "unknown")
+          root.audioEvent({ type: "checked", generation: audioCheckProc.attempt, check: check })
+        } catch (e) { root.audioFailure("Could not check audio setup. Please retry.", audioCheckProc.attempt) }
+      }
+    }
+    onExited: function (exitCode, exitStatus) {
+      audioCheckDeadline.stop()
+      if (!handled && root.audioFlow.phase === "checking")
+        root.audioFailure("Could not check audio setup. Please retry.", attempt)
+      root.finishAudioStop()
+      Qt.callLater(function () {
+        if (root.audioFlow.phase === "checking" && root.audioFlow.generation !== audioCheckProc.attempt) root.beginAudioCheck()
+      })
+    }
+  }
+
+  Process {
+    id: nativeSetupProc
+    property int attempt: 0
+    property var result: null
+    property string failureText: ""
+    command: root.setupKind === "firewall"
+      ? [root.bin, "--ip", root.setupPlayerIp, "setup-firewall", "--port", String(root.setupPort)]
+      : [root.bin, "install-audio-tools"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { nativeSetupProc.result = JSON.parse(text) }
+        catch (e) { nativeSetupProc.result = null }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: nativeSetupProc.failureText = text.trim().slice(-500)
+    }
+    onExited: function (exitCode, exitStatus) {
+      var reply = result || { ok: false, message: failureText || "Setup did not return a result. Please retry." }
+      if (exitCode !== 0 && reply.ok) reply = { ok: false, message: "Setup failed. Please retry." }
+      root.audioEvent({ type: "authorized", generation: attempt, result: reply })
+      root.finishAudioStop()
+      Qt.callLater(root.beginAudioCheck)
+    }
+  }
+
+  Process {
+    id: localoutProc
+    property int attempt: 0
+    property string failureText: ""
+    onStarted: if (!root.audioFlow.wanted || attempt !== root.audioFlow.generation) signal(15)
+    command: [root.bin, "--ip", root.localoutFirewallIp, "localout", "--port", String(root.localoutPort)]
+    running: false
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function (data) {
+        var event = Model.parseLine(data)
+        if (!event) return
+        if (event.event === "network-help")
+          root.audioEvent({ type: "network-help", generation: localoutProc.attempt,
+            canSetupFirewall: root.localoutCanSetupFirewall && root.checkedAudioFirewall !== "allowed" && root.checkedAudioFirewall !== "inactive" })
+        else if (event.event === "local-audio")
+          root.audioEvent({ type: "progress", generation: localoutProc.attempt, phase: event.state })
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: localoutProc.failureText = text.trim().slice(-600)
+    }
+    onExited: function (exitCode, exitStatus) {
+      if (root.audioFlow.wanted && attempt === root.audioFlow.generation && !root.localoutNeedsNetworkHelp)
+        root.audioFailure(failureText || "Local audio stopped unexpectedly. Please retry.", attempt)
+      root.finishAudioStop()
+      Qt.callLater(function () {
+        root.beginAudioAuthorization()
+        root.beginAudioStream()
+      })
+    }
+  }
+
+  function revealAudioSetup() {
+    if (!opened) return
+    root.setCursor("device", 0)
+    Qt.callLater(function () {
+      var view = scrollArea.contentItem
+      if (view && "contentY" in view)
+        view.contentY = Math.min(audioDeviceSection.y, Math.max(0, scrollArea.contentHeight - scrollArea.availableHeight))
+    })
+  }
+
+  function dismissAudioNotification() {
+    if (audioNoticeProc.running && !audioNoticeDismiss.running) audioNoticeDismiss.running = true
+  }
+
+  function notifyAudioAttention() {
+    if (fixtureMode || opened || !AudioFlow.needsAttention(audioFlow) || audioNoticeProc.running) return
+    var key = audioFlow.generation + ":" + audioFlow.phase
+    if (lastAudioNotification === key) return
+    lastAudioNotification = key
+    audioNotificationText = AudioFlow.statusText(audioFlow) + "\nClick to continue setup."
+    audioNoticeProc.attempt = audioFlow.generation
+    audioNoticeProc.running = true
+  }
+
+  Process {
+    id: audioNoticeProc
+    property int attempt: 0
+    command: ["notify-send", "--app-name=WiiM", "--expire-time=15000", "--transient",
+              "--action=default=Continue setup", "WiiM local audio", root.audioNotificationText]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text.trim() === "default" && audioNoticeProc.attempt === root.audioFlow.generation && AudioFlow.needsAttention(root.audioFlow)) {
+          root.open()
+          root.revealAudioSetup()
+        }
+      }
+    }
+    onExited: Qt.callLater(root.notifyAudioAttention)
+  }
+  Process {
+    id: audioNoticeDismiss
+    command: ["omarchy-shell", "notifications", "dismiss", "WiiM local audio"]
   }
 
   // progress + sleep countdown smoothing
@@ -462,8 +691,8 @@ Panel {
   function stopDaemon() {
     restartTimer.stop()
     if (daemonProc.running) {
+      daemonProc.signal(15)
       daemonProc.running = false
-      daemonProc.terminate()
     }
   }
 
@@ -473,8 +702,7 @@ Panel {
     if (fixtureMode) {
       stopDaemon()
       if (root.localoutOn) {
-        root.localoutOn = false
-        localoutProc.running = false
+        root.audioEvent({ type: "disable" })
       }
       initFixture()
     } else {
@@ -553,6 +781,13 @@ Panel {
   }
 
   onOpenedChanged: {
+    if (!opened) {
+      setupConfirm.opened = false
+      notifyAudioAttention()
+    } else {
+      dismissAudioNotification()
+      if (AudioFlow.needsAttention(audioFlow)) Qt.callLater(root.revealAudioSetup)
+    }
     if (root.opened) {
       root.refresh()
       root.refreshLibrary()
@@ -622,7 +857,13 @@ Panel {
         daemonReady: root.daemonReady, lastError: root.lastError,
         fixtureMode: root.fixtureMode, settings: root.settings,
         serve: root.serveInfo, libPath: root.libPath, libRows: root.libRows.length,
-        focusSection: root.focusSection
+        focusSection: root.focusSection,
+        pluginVersion: root.manifest && root.manifest.version ? root.manifest.version : "1.2.0",
+        displayedTitle: barLabel.text,
+        metadataTitle: root.snap && root.snap.meta ? root.snap.meta.title : "",
+        localoutError: root.localoutError,
+        networkHelp: root.localoutNeedsNetworkHelp,
+        audio: root.audioFlow
       })
     }
   }
@@ -641,13 +882,38 @@ Panel {
       anchors.centerIn: parent
       spacing: Style.space(6)
 
-      EqMark {
-        id: mark0
+      Item {
         anchors.verticalCenter: parent.verticalCenter
-        size: Style.bar.iconCanvas
-        ink: root.chipInk
-        animating: root.chipState === "playing"
-        showSpeaker: root.chipState === "offline"
+        width: Style.bar.iconCanvas
+        height: width
+        EqMark {
+          id: mark0
+          anchors.fill: parent
+          size: Style.bar.iconCanvas
+          ink: root.chipInk
+          animating: root.chipState === "playing" && !root.audioPending
+          showSpeaker: root.chipState === "offline"
+          visible: !root.audioPending
+        }
+        Text {
+          anchors.centerIn: parent
+          visible: root.audioPending
+          text: "◌"
+          color: root.fg
+          font.family: root.ff
+          font.pixelSize: Style.font.icon
+          NumberAnimation on rotation {
+            from: 0; to: 360; duration: 1000; loops: Animation.Infinite
+            running: root.audioPending
+          }
+        }
+        Rectangle {
+          visible: AudioFlow.needsAttention(root.audioFlow)
+          width: Style.space(5); height: width; radius: width / 2
+          anchors.top: parent.top
+          anchors.right: parent.right
+          color: Color.urgent
+        }
       }
 
       // Now-playing text: glides when it does not fit (brumm-style), else
@@ -667,7 +933,9 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           width: implicitWidth
           textFormat: Text.PlainText
-          text: Model.barLabel(root.snap)
+          text: AudioFlow.needsAttention(root.audioFlow) ? "Local audio · " + (root.audioFlow.phase === "failed" ? "Retry" : "Setup needed")
+              : root.audioPending ? "Local audio · " + ({ checking: "Checking", authorizing: "Authorizing", connecting: "Connecting", buffering: "Buffering", stopping: "Stopping" })[root.audioFlow.phase]
+              : Model.barLabel(root.snap)
           color: root.fg
           font.family: root.ff
           font.pixelSize: Style.font.body
@@ -701,7 +969,7 @@ Panel {
         if (!root.fixedVol)
           root.volStepBy(wheel.angleDelta.y > 0 ? root.volStep : -root.volStep)
       }
-      onEntered: if (root.bar) root.bar.showTooltip(chip, Model.tooltipText(root.snap))
+      onEntered: if (root.bar) root.bar.showTooltip(chip, (AudioFlow.statusText(root.audioFlow) || Model.tooltipText(root.snap)) + " · ~10 seconds lag added by WiiM")
       onExited: if (root.bar) root.bar.hideTooltip(chip)
     }
   }
@@ -726,6 +994,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      enabled: !setupConfirm.opened
 
       onMoveRequested: function (dx, dy) { root.moveCursor(dx, dy) }
       onReturnRequested: root.viaEnter = true
@@ -1188,6 +1457,7 @@ Panel {
 
           // ---------- Device ----------
           Column {
+            id: audioDeviceSection
             width: parent.width
             spacing: Style.spacing.labelGap
 
@@ -1226,7 +1496,7 @@ Panel {
               ToggleSwitch {
                 anchors.verticalCenter: parent.verticalCenter
                 checked: root.localoutOn
-                interactive: root.online && !root.fixtureMode
+                interactive: root.online && !root.fixtureMode && (root.localoutOn || (!nativeSetupProc.running && !localoutProc.running && root.audioFlow.phase !== "stopping"))
                 foreground: root.fg
                 onToggled: root.setLocalout(!checked)
               }
@@ -1236,7 +1506,7 @@ Panel {
                 spacing: 1
                 Text {
                   width: parent.width
-                  text: "Local audio out"
+                  text: "Play PC audio through WiiM"
                   color: root.fg
                   opacity: root.localoutOn ? 0.95 : 0.7
                   font.family: root.ff
@@ -1245,9 +1515,7 @@ Panel {
                 }
                 Text {
                   width: parent.width
-                  text: root.localoutOn
-                    ? "on · lossless 44.1 kHz · a few seconds behind"
-                    : "desktop audio → this WiiM"
+                  text: "~10 seconds lag added by WiiM"
                   color: root.fg
                   opacity: 0.5
                   font.family: root.ff
@@ -1257,15 +1525,70 @@ Panel {
               }
             }
 
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: root.audioFlow.phase !== "off" || root.audioFlow.notice !== ""
+              Text {
+                id: audioSpinner
+                visible: root.audioPending
+                text: "◌"
+                color: root.fg
+                font.family: root.ff
+                font.pixelSize: Style.font.body
+                NumberAnimation on rotation {
+                  from: 0; to: 360; duration: 1000; loops: Animation.Infinite
+                  running: root.audioPending && root.opened
+                }
+              }
+              Text {
+                width: parent.width - (audioSpinner.visible ? audioSpinner.width + parent.spacing : 0)
+                textFormat: Text.PlainText
+                text: root.audioFlow.phase === "stopping" && nativeSetupProc.running
+                  ? "Finishing setup; audio will stay off…" : AudioFlow.statusText(root.audioFlow)
+                wrapMode: Text.Wrap
+                color: root.audioFlow.phase === "failed" ? Color.urgent : root.fg
+                font.family: root.ff
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Button {
+              width: parent.width
+              visible: root.localoutNeedsTools && root.localoutCanInstall
+              text: "Install audio tools (libpulse)…"
+              bordered: true
+              foreground: root.fg
+              fontFamily: root.ff
+              enabled: !nativeSetupProc.running
+              hasCursor: root.cursorActive && root.focusSection === "device"
+              onHovered: function (h) { if (h) root.setCursor("device", 0) }
+              onClicked: root.requestSetup("tools")
+            }
+
+            Button {
+              width: parent.width
+              visible: root.localoutNeedsNetworkHelp && root.localoutCanSetupFirewall
+              text: "Allow this WiiM through firewall…"
+              bordered: true
+              foreground: root.fg
+              fontFamily: root.ff
+              enabled: !nativeSetupProc.running && !localoutProc.running
+              hasCursor: root.cursorActive && root.focusSection === "device"
+              onHovered: function (h) { if (h) root.setCursor("device", 0) }
+              onClicked: root.requestSetup("firewall")
+            }
+
             Text {
               width: parent.width
-              visible: root.loadStalled
-              text: "Stream not starting — the speaker cannot reach this PC (firewall? run: wiim firewall)"
-              color: Color.urgent
-              opacity: 0.9
+              visible: root.localoutNeedsNetworkHelp
+              textFormat: Text.PlainText
+              text: "Access is limited to this WiiM. Audio starts automatically after authorization."
+              wrapMode: Text.Wrap
+              color: root.fg
+              opacity: 0.7
               font.family: root.ff
               font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
             }
 
             Text {
@@ -1279,13 +1602,36 @@ Panel {
               elide: Text.ElideRight
             }
 
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              visible: root.audioFlow.phase === "failed"
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: "Retry audio"
+                bordered: true
+                foreground: root.fg
+                fontFamily: root.ff
+                enabled: !localoutProc.running && !nativeSetupProc.running && root.online
+                onClicked: root.setLocalout(true)
+              }
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: "Dismiss"
+                bordered: true
+                foreground: root.fg
+                fontFamily: root.ff
+                onClicked: root.setLocalout(false)
+              }
+            }
+
             Button {
               width: parent.width
               text: root.online ? "Refresh now" : "Retry connection"
               bordered: true
               foreground: root.fg
               fontFamily: root.ff
-              hasCursor: root.cursorActive && root.focusSection === "device"
+              hasCursor: root.cursorActive && root.focusSection === "device" && !AudioFlow.needsAttention(root.audioFlow)
               onClicked: root.refresh()
               onHovered: function (h) { if (h) root.setCursor("device", 0) }
             }
@@ -1323,6 +1669,27 @@ Panel {
           }
         }
       }
+    }
+
+    ConfirmDialog {
+      id: setupConfirm
+      anchors.fill: parent
+      z: 20
+      foreground: root.fg
+      fontFamily: root.ff
+      message: root.setupKind === "firewall"
+        ? "Allow your WiiM (" + root.setupPlayerIp + ") to receive local audio?\n\nThis permits that player to connect to TCP " + root.setupPort + " on this PC. The rule remains until removed. Omarchy will ask you to authenticate."
+        : "Install audio tools?\n\nThis installs the libpulse package using your system package manager. Omarchy will ask you to authenticate."
+      confirmText: root.setupKind === "firewall" ? "Allow" : "Install"
+      onOpenedChanged: {
+        if (opened) forceActiveFocus()
+        else keyCatcher.forceActiveFocus()
+      }
+      Keys.onPressed: function (event) {
+        if (handleKey(event)) event.accepted = true
+      }
+      onCanceled: { opened = false; root.audioEvent({ type: "cancel-setup" }) }
+      onConfirmed: root.applySetup()
     }
   }
 

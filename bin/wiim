@@ -50,11 +50,13 @@ import concurrent.futures
 import contextlib
 import hashlib
 import http.server
+import ipaddress
 import json
 import os
 import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -62,6 +64,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -421,6 +424,10 @@ def normalize_meta(meta, player):
         return "" if v.strip().lower().replace("_", "") in ("", "unknown", "unknow", "none") else v
     title, artist, album = clean(title), clean(artist), clean(album)
     art, rate, depth = clean(art), clean(rate), clean(depth)
+    # Normalize before publishing snapshots as well as in the display model:
+    # a long-lived shell can retain an older imported JavaScript module.
+    if re.fullmatch(r"https?://[^/]+/live\.wav(?:[?#].*)?", title):
+        title, artist, album = "Local audio", "", ""
     return {"title": title, "artist": artist, "album": album,
             "artUrl": art, "sampleRate": rate, "bitDepth": depth}
 
@@ -957,6 +964,7 @@ LOCALOUT_PORT_DEFAULT = 7402
 SERVE_PORT_DEFAULT = 7401
 LIVE_WAV_RATE = 44100
 LIVE_WAV_CHUNK = 7056  # 40 ms of s16 stereo
+LOCALOUT_CONNECT_TIMEOUT = 15
 
 
 def build_wav_header(rate=LIVE_WAV_RATE, channels=2, bits=16,
@@ -1055,6 +1063,9 @@ class LiveHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Accept-Ranges", "none")
             self.end_headers()
             self.wfile.write(build_wav_header())
+            self.wfile.write(self.server.initial_pcm)
+            self.server.initial_pcm = b""
+            self.server.connected.set()
             while True:
                 chunk = self.server.pcm.read(LIVE_WAV_CHUNK)
                 if not chunk:
@@ -1070,76 +1081,286 @@ class LiveServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.initial_pcm = b""
+        self.connected = threading.Event()
+
+
+def localout_capture_command(sink):
+    # Use the same Pulse protocol as pactl: its monitor source exists even
+    # while WirePlumber is still discovering the underlying native sink node.
+    return ["parec", "--raw", "--format", "s16le",
+            "--rate", str(LIVE_WAV_RATE), "--channels", "2",
+            "--device", sink + ".monitor"]
+
+
+def native_setup_available(tool):
+    return all(os.access("/usr/bin/" + name, os.X_OK) for name in ("pkexec", tool))
+
+
+def audio_tools_status():
+    missing = [name for name in ("pactl", "parec") if shutil.which(name) is None]
+    return {"missing": missing, "ready": not missing,
+            "canInstall": native_setup_available("pacman"),
+            "canSetupFirewall": native_setup_available("ufw")}
+
+
+def setup_result(ok, message, changed=False, canceled=False):
+    out_json({"ok": ok, "message": message, "changed": changed, "canceled": canceled})
+    return 0 if ok else 1
+
+
+def run_native_admin(argv, success):
+    # Authenticate through Omarchy's registered Polkit agent. Never escalate
+    # Python, shell code, or a helper from the user's writable plugin checkout.
+    try:
+        result = subprocess.run(["/usr/bin/pkexec", "--disable-internal-agent"] + argv,
+                                capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return setup_result(False, "Setup timed out. Check the system state before retrying.")
+    if result.returncode == 126:
+        return setup_result(False, "Authorization canceled. Nothing changed.", canceled=True)
+    if result.returncode == 127:
+        return setup_result(False, "Authorization unavailable. Check that Omarchy's Polkit agent is running.")
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "System command failed").strip()[-500:]
+        return setup_result(False, detail)
+    return setup_result(True, success, changed=True)
+
+
+def validate_audio_destination(ip, port):
+    try:
+        ip = str(ipaddress.ip_address(ip))
+        port = int(port)
+        if not 1024 <= port <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise WiimError("audio setup requires a player IP and a port from 1024 to 65535")
+    return ip, port
+
+
+def firewall_preflight(ip, port):
+    ip, port = validate_audio_destination(ip, port)
+    try:
+        with open("/etc/ufw/ufw.conf") as f:
+            config = f.read(65536)
+        if re.search(r"^\s*ENABLED\s*=\s*no\s*$", config, re.MULTILINE):
+            return "inactive"
+        if not re.search(r"^\s*ENABLED\s*=\s*yes\s*$", config, re.MULTILINE):
+            return "unknown"
+        with open("/etc/ufw/user6.rules" if ":" in ip else "/etc/ufw/user.rules") as f:
+            rules = f.read(1024 * 1024)
+        address = ipaddress.ip_address(ip)
+        for line in rules.splitlines():
+            try:
+                args = shlex.split(line)
+                def arg(key, default=None):
+                    return args[args.index(key) + 1] if key in args else default
+                if arg("-A") != "ufw-user-input" or arg("-p", "tcp") not in ("tcp", "all") or "-d" in args:
+                    continue
+                network = arg("-s")
+                if network and address not in ipaddress.ip_network(network, strict=False):
+                    continue
+                ports = arg("--dport") or arg("--dports")
+                if ports:
+                    spans = [part.split(":") for part in ports.split(",")]
+                    if not any(int(span[0]) <= port <= int(span[-1]) for span in spans):
+                        continue
+                if arg("-j") == "ACCEPT":
+                    return "allowed"
+                if arg("-j") in ("DROP", "REJECT"):
+                    return "unknown"  # a conflicting explicit rule needs inspection
+            except (ValueError, IndexError):
+                continue
+        with open("/etc/default/ufw") as f:
+            defaults = f.read(65536)
+        if re.search(r'^\s*DEFAULT_INPUT_POLICY=["\']?ACCEPT', defaults, re.MULTILINE):
+            return "allowed"
+        if re.search(r'^\s*DEFAULT_INPUT_POLICY=["\']?(DROP|REJECT)', defaults, re.MULTILINE):
+            return "needs-rule"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def audio_preflight(ip, port):
+    ip, port = validate_audio_destination(ip, port)
+    tools = audio_tools_status()
+    tools.update({"ip": ip, "port": port, "firewall": firewall_preflight(ip, port)})
+    return tools
+
+
+def setup_firewall(ip, port):
+    ip, port = validate_audio_destination(ip, port)
+    if not native_setup_available("ufw"):
+        return setup_result(False, "Graphical UFW setup is unavailable on this system.")
+    state = firewall_preflight(ip, port)
+    if state == "inactive":
+        return setup_result(True, "UFW is inactive. Continuing audio setup.")
+    if state == "allowed":
+        return setup_result(True, "This WiiM already has firewall access. Continuing audio setup.")
+    return run_native_admin([
+        "/usr/bin/ufw", "allow", "from", ip, "to", "any", "port", str(port),
+        "proto", "tcp", "comment", "ric.wiim desktop audio"],
+        "Firewall access is ready. Continuing audio setup.")
+
+
+def install_audio_tools():
+    status = audio_tools_status()
+    if status["ready"]:
+        return setup_result(True, "Audio tools are already installed.")
+    if not status["canInstall"]:
+        return setup_result(False, "Graphical package setup is unavailable. Install pactl and parec using your package manager.")
+    # The in-panel confirmation names this fixed package. Pacman runs without
+    # terminal prompts; administrator authentication belongs solely to Polkit.
+    return run_native_admin(["/usr/bin/pacman", "-S", "--needed", "--noconfirm", "libpulse"],
+                            "Audio tools installed. Continuing audio setup.")
+
+
+def capture_first_pcm(pw, errors, timeout=5):
+    if select.select([pw.stdout], [], [], timeout)[0]:
+        chunk = os.read(pw.stdout.fileno(), LIVE_WAV_CHUNK)
+        if chunk:
+            return chunk
+    errors.seek(0)
+    detail = errors.read().decode("utf-8", errors="replace").strip()[-500:]
+    raise WiimError("PipeWire capture produced no audio data"
+                    + (": " + detail if detail else " (check the WiiM sink connection)"))
+
+
+def local_audio_event(state):
+    print(json.dumps({"event": "local-audio", "state": state}), flush=True)
+
 
 def cmd_localout(args):
-    if shutil.which("pw-cat") is None:
-        raise WiimError("pw-cat not found (PipeWire required)")
+    missing = audio_tools_status()["missing"]
+    if missing:
+        raise WiimError("missing audio tools: %s; enable desktop audio in the panel for setup"
+                        % ", ".join(missing))
     ip = resolve_ip(args)
     dev = Device(ip, timeout=args.timeout)
     sink, port = args.sink, args.port
 
-    prev_default = parse_default_sink(pactl(["info"]))
-    # Clear stale sinks from crashed runs so the name is unambiguous.
-    for stale in parse_null_module_indices(
-            pactl(["list", "modules", "short"]), sink):
-        with contextlib.suppress(Exception):
-            pactl(["unload-module", str(stale)])
-    mod_index = parse_pactl_index(pactl([
-        "load-module", "module-null-sink", "sink_name=%s" % sink,
-        "sink_properties=device.description=WiiM_Out"]))
+    prev_default = ""
+    mod_index = None
     pw = None
     srv = None
+    errors = tempfile.TemporaryFile()
+    stop = threading.Event()
+    old_signals = {}
+    moved_inputs = []
+    routing_changed = False
+    play_requested = False
     try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            old_signals[sig] = signal.signal(sig, lambda *a: stop.set())
+        prev_default = parse_default_sink(pactl(["info"]))
+        for stale in parse_null_module_indices(pactl(["list", "modules", "short"]), sink):
+            with contextlib.suppress(Exception):
+                pactl(["unload-module", str(stale)])
+        if stop.is_set():
+            return 0
+        mod_index = parse_pactl_index(pactl([
+            "load-module", "module-null-sink", "sink_name=%s" % sink,
+            "sink_properties=device.description=WiiM_Out"]))
+        local_audio_event("connecting")
         sink_index = parse_sink_index(pactl(["list", "short", "sinks"]), sink)
         if sink_index is None:
             raise WiimError("sink did not appear: %s" % sink)
-        for sid in parse_sink_input_ids(pactl(["list", "short", "sink-inputs"])):
-            with contextlib.suppress(Exception):
-                pactl(["move-sink-input", str(sid), str(sink_index)])
-        pactl(["set-default-sink", sink])
-
         pw = subprocess.Popen(
-            ["pw-cat", "--record", "--raw", "--format", "s16",
-             "--rate", str(LIVE_WAV_RATE), "--channels", "2",
-             "--target", sink + ".monitor", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            localout_capture_command(sink),
+            stdout=subprocess.PIPE, stderr=errors)
+
+        first_pcm = capture_first_pcm(pw, errors)
 
         srv = LiveServer(("0.0.0.0", port), LiveHandler)
         srv.pcm = pw.stdout
+        srv.initial_pcm = first_pcm
         srv.stream_lock = threading.Lock()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
+        if stop.is_set():
+            return 0
         url = "http://%s:%d/live.wav" % (local_ip_for(ip), port)
+        play_requested = True
         dev.play_url(url)
+        deadline = time.monotonic() + LOCALOUT_CONNECT_TIMEOUT
+        while not srv.connected.wait(0.1):
+            if stop.is_set():
+                return 0
+            if pw.poll() is not None:
+                raise WiimError("PipeWire capture exited before the WiiM connected")
+            if time.monotonic() >= deadline:
+                print(json.dumps({"event": "network-help", "ip": ip, "port": port}), flush=True)
+                raise WiimError("WiiM did not connect to %s; check inbound TCP %d and LAN reachability"
+                                % (url, port))
+
+        if stop.is_set():
+            return 0
+        # Route applications only after capture and the player's HTTP pull work.
+        # Snapshot first: WirePlumber can move streams as soon as default changes.
+        input_routes = pactl(["list", "short", "sink-inputs"])
+        routing_changed = True
+        pactl(["set-default-sink", sink])
+        for line in input_routes.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+                with contextlib.suppress(WiimError):
+                    pactl(["move-sink-input", fields[0], str(sink_index)])
+                    moved_inputs.append((fields[0], fields[1]))
         out_json({"localout": "on", "sink": sink, "port": port, "url": url,
                   "previousSink": prev_default,
-                  "note": "lossless 44.1 kHz; expect a few seconds of delay"})
+                  "note": "music only; expect roughly 10 seconds of delay; unsuitable for video"})
 
-        stop = threading.Event()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(sig, lambda *a: stop.set())
+        local_audio_event("buffering")
+        playback_deadline = time.monotonic() + 45
+        streaming = False
         while not stop.wait(0.5):
+            if not streaming:
+                status = dev.player_status()
+                if isinstance(status, dict) and status.get("status") == "play":
+                    streaming = True
+                    local_audio_event("streaming")
+                elif time.monotonic() >= playback_deadline:
+                    raise WiimError("WiiM did not begin playback. Check its connection and retry.")
             if pw.poll() is not None:
-                break
+                errors.seek(0)
+                detail = errors.read().decode("utf-8", errors="replace").strip()[-500:]
+                raise WiimError("PipeWire capture stopped unexpectedly (exit %s)%s"
+                                % (pw.returncode, ": " + detail if detail else ""))
     finally:
         # Teardown: stop our stream on the device, restore the old default,
         # unload the sink, kill the capture. Every step is best-effort.
-        with contextlib.suppress(Exception):
-            blob = json.dumps(dev.meta(), default=str)
-            if "/live.wav" in blob or str(port) in blob:
-                dev.stop()
+        if play_requested:
+            with contextlib.suppress(Exception):
+                blob = json.dumps(dev.meta(), default=str)
+                if "/live.wav" in blob or str(port) in blob:
+                    dev.stop()
         if pw is not None and pw.poll() is None:
             pw.terminate()
             with contextlib.suppress(Exception):
                 pw.wait(timeout=3)
+            if pw.poll() is None:
+                pw.kill()
+                pw.wait()
         if srv is not None:
             srv.shutdown()
             srv.server_close()
-        if prev_default:
+        if pw is not None:
+            pw.stdout.close()
+        if routing_changed and prev_default:
             with contextlib.suppress(Exception):
                 pactl(["set-default-sink", prev_default])
-        with contextlib.suppress(Exception):
-            pactl(["unload-module", str(mod_index)])
+        for sid, original_sink in moved_inputs:
+            with contextlib.suppress(Exception):
+                pactl(["move-sink-input", sid, original_sink])
+        if mod_index is not None:
+            with contextlib.suppress(Exception):
+                pactl(["unload-module", str(mod_index)])
+        errors.close()
+        for sig, handler in old_signals.items():
+            signal.signal(sig, handler)
         out_json({"localout": "off", "restoredSink": prev_default})
     return 0
 
@@ -1412,6 +1633,13 @@ def main(argv=None):
     p.add_argument("--port", type=int, default=LOCALOUT_PORT_DEFAULT)
     p.add_argument("--sink", default="wiim-out")
 
+    sub.add_parser("audio-tools", help="check optional desktop audio dependencies")
+    p = sub.add_parser("audio-check", help="fast local audio setup checks; no network or privilege prompts")
+    p.add_argument("--port", type=int, default=LOCALOUT_PORT_DEFAULT)
+    sub.add_parser("install-audio-tools", help="install optional audio tools with graphical authentication (Arch)")
+    p = sub.add_parser("setup-firewall", help="check UFW and offer a player-specific audio rule")
+    p.add_argument("--port", type=int, default=LOCALOUT_PORT_DEFAULT)
+
     sub.add_parser("firewall",
                    help="print the ufw rule for library + local audio out")
 
@@ -1449,6 +1677,18 @@ def music_dir_for(args):
 
 
 def dispatch(args):
+    if args.cmd == "audio-check":
+        if not args.ip:
+            raise WiimError("audio-check requires --ip from the selected player")
+        out_json(audio_preflight(args.ip, args.port))
+        return 0
+    if args.cmd == "audio-tools":
+        out_json(audio_tools_status())
+        return 0
+    if args.cmd == "install-audio-tools":
+        return install_audio_tools()
+    if args.cmd == "setup-firewall":
+        return setup_firewall(resolve_ip(args), args.port)
     if args.cmd == "discover":
         devs = discover(timeout=args.disc_timeout)
         out_json(devs)

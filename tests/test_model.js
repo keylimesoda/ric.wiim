@@ -56,6 +56,16 @@ t("barLabel", () => {
   assert.equal(M.barLabel(s), "");
 });
 
+t("local audio labels hide the live URL", () => {
+  const s = M.fixtureSnapshot();
+  s.meta.title = "http://192.0.2.10:7402/live.wav";
+  assert.equal(M.barLabel(s), "Local audio");
+  assert.equal(M.heroTitle(s), "Local audio");
+  assert.ok(!M.tooltipText(s).includes("192.0.2.10"));
+  s.meta.title = "http://192.0.2.10:7401/f/live.wav";
+  assert.equal(M.heroTitle(s), s.meta.title);
+});
+
 t("volIcon", () => {
   assert.equal(M.volIcon(0, false), M.ICON.volMute);
   assert.equal(M.volIcon(50, true), M.ICON.volMute);
