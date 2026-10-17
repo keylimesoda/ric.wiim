@@ -55,9 +55,15 @@ keyboard-driven control panel, backed by a stdlib-only Python CLI/daemon.
 
 - `bin/wiim` — Python 3 stdlib only. HTTPS GET to `https://<ip>/httpapi.asp`
   (self-signed cert: unverified TLS; LAN device, no credentials involved).
-- Local HTTP file server (library playback): binds `0.0.0.0:<ephemeral>`,
-  serves only files under `musicDir`, Range support, no dotfiles, no
-  listings over HTTP. Documented in README.
+- Local HTTP file server (library playback): binds `0.0.0.0:7401`
+  (fixed, firewall-friendly), serves only files under `musicDir`,
+  Range support, no dotfiles, no listings over HTTP. Documented in README.
+- Desktop audio out (`wiim localout`, experimental): creates a PipeWire
+  null sink via `pactl`, captures its monitor with `pw-cat`, and serves
+  an endless lossless WAV on `0.0.0.0:7402` (`/live.wav`, HTTP/1.0
+  close-delimited — what the player's Lavf client accepts). Full
+  teardown on exit restores the previous default sink and unloads the
+  module. Needs one documented ufw rule; no sudo from the plugin.
 - `omarchy-shell media status|playPause|next|previous` (media router only).
 - No sudo, no credentials, no cloud APIs.
 
@@ -95,3 +101,11 @@ error) · `fixture` (prototype/demo mode).
 - Tidal *search/login*: cloud-account APIs need credentials — out of scope.
   Tidal Connect streams are controlled (transport/metadata) once pushed.
 - MPRIS bridge (expose WiiM to the built-in media widget): possible later.
+- Desktop-out transport history (2026-10-17): Bluetooth A2DP rejected by
+  the user (lossy; pairing dance). AirPlay considered — the Receiver
+  enforces FairPlay (plain RAOP ANNOUNCE → 403; SETUP phase 2 ignored),
+  and no mature open-source Linux AirPlay *sender* exists (airplay2-rs
+  is alpha). The player's own HTTP client (Lavf) accepts an endless
+  lossless WAV stream instead — chosen. The earlier "AP client
+  isolation" diagnosis was wrong: the host's ufw (default-deny input)
+  was blocking inbound fetches all along.

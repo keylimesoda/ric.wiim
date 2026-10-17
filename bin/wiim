@@ -36,6 +36,8 @@ USAGE
   wiim play-album <rel>                  serve + play a whole album dir
   wiim serve [--dir D] [--port P]        run the file server (foreground)
   wiim daemon [--dir D] [--port P]       resident: watch + serve + stdin cmds
+  wiim localout [--port P] [--sink N]   stream desktop audio to the WiiM
+  wiim firewall                          print the ufw rule for inbound audio
   wiim media <playPause|next|previous>   smart media-key router (WiiM vs MPRIS)
   wiim config show | wiim config set <k> <v>
 
@@ -53,8 +55,11 @@ import os
 import queue
 import re
 import select
+import shutil
+import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -939,6 +944,207 @@ def media_route(action, dev, prefer):
 
 
 # --------------------------------------------------------------------------
+# localout: PipeWire null sink -> live WAV stream -> device play-url
+#
+# One button, zero discovery: creates a "wiim-out" sink, makes it the
+# default output, streams its monitor as an endless lossless WAV over
+# HTTP, and points the WiiM at it. On exit everything is undone: old
+# default sink restored, module unloaded, stream stopped.
+# Needs inbound TCP on the localout port (see: wiim firewall).
+# --------------------------------------------------------------------------
+
+LOCALOUT_PORT_DEFAULT = 7402
+SERVE_PORT_DEFAULT = 7401
+LIVE_WAV_RATE = 44100
+LIVE_WAV_CHUNK = 7056  # 40 ms of s16 stereo
+
+
+def build_wav_header(rate=LIVE_WAV_RATE, channels=2, bits=16,
+                     data_size=0x7FF00000):
+    """WAV header with a huge (effectively endless) data chunk."""
+    byte_rate = rate * channels * bits // 8
+    return (struct.pack("<4sI4s", b"RIFF", data_size + 36, b"WAVE")
+            + struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, channels, rate,
+                          byte_rate, channels * bits // 8, bits)
+            + struct.pack("<4sI", b"data", data_size))
+
+
+def parse_pactl_index(text):
+    line = (text or "").strip().splitlines()
+    if not line:
+        raise WiimError("unexpected pactl output: empty")
+    try:
+        return int(line[0].strip())
+    except ValueError:
+        raise WiimError("unexpected pactl output: %r" % text[:80])
+
+
+def parse_sink_index(text, name):
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1] == name:
+            try:
+                return int(parts[0])
+            except ValueError:
+                continue
+    return None
+
+
+def parse_sink_input_ids(text):
+    ids = []
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if parts and parts[0].isdigit():
+            ids.append(int(parts[0]))
+    return ids
+
+
+def parse_null_module_indices(modules_text, sink_name):
+    """Module indices of null-sinks already bound to this sink name."""
+    ids = []
+    for line in (modules_text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1] == "module-null-sink" \
+                and ("sink_name=%s " % sink_name) in (parts[2] + " "):
+            try:
+                ids.append(int(parts[0]))
+            except ValueError:
+                continue
+    return ids
+
+
+def parse_default_sink(info_text):
+    for line in (info_text or "").splitlines():
+        if line.startswith("Default Sink:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def pactl(args_list, timeout=5):
+    try:
+        r = subprocess.run(["pactl"] + args_list, capture_output=True,
+                           text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise WiimError("pactl not found (PipeWire/PulseAudio session required)")
+    if r.returncode != 0:
+        raise WiimError("pactl %s failed: %s"
+                        % (" ".join(args_list), (r.stderr or "").strip()))
+    return r.stdout
+
+
+class LiveHandler(http.server.BaseHTTPRequestHandler):
+    """Endless WAV stream; HTTP/1.0 close-delimited (what Linkplay's
+    Lavf client accepts). One stream at a time; latecomers get 503."""
+
+    protocol_version = "HTTP/1.0"
+    server_version = "wiim/1.0"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if urllib.parse.urlparse(self.path).path != "/live.wav":
+            self.send_error(404)
+            return
+        if not self.server.stream_lock.acquire(blocking=False):
+            self.send_error(503)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Accept-Ranges", "none")
+            self.end_headers()
+            self.wfile.write(build_wav_header())
+            while True:
+                chunk = self.server.pcm.read(LIVE_WAV_CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            self.server.stream_lock.release()
+
+
+class LiveServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def cmd_localout(args):
+    if shutil.which("pw-cat") is None:
+        raise WiimError("pw-cat not found (PipeWire required)")
+    ip = resolve_ip(args)
+    dev = Device(ip, timeout=args.timeout)
+    sink, port = args.sink, args.port
+
+    prev_default = parse_default_sink(pactl(["info"]))
+    # Clear stale sinks from crashed runs so the name is unambiguous.
+    for stale in parse_null_module_indices(
+            pactl(["list", "modules", "short"]), sink):
+        with contextlib.suppress(Exception):
+            pactl(["unload-module", str(stale)])
+    mod_index = parse_pactl_index(pactl([
+        "load-module", "module-null-sink", "sink_name=%s" % sink,
+        "sink_properties=device.description=WiiM_Out"]))
+    pw = None
+    srv = None
+    try:
+        sink_index = parse_sink_index(pactl(["list", "short", "sinks"]), sink)
+        if sink_index is None:
+            raise WiimError("sink did not appear: %s" % sink)
+        for sid in parse_sink_input_ids(pactl(["list", "short", "sink-inputs"])):
+            with contextlib.suppress(Exception):
+                pactl(["move-sink-input", str(sid), str(sink_index)])
+        pactl(["set-default-sink", sink])
+
+        pw = subprocess.Popen(
+            ["pw-cat", "--record", "--raw", "--format", "s16",
+             "--rate", str(LIVE_WAV_RATE), "--channels", "2",
+             "--target", sink + ".monitor", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        srv = LiveServer(("0.0.0.0", port), LiveHandler)
+        srv.pcm = pw.stdout
+        srv.stream_lock = threading.Lock()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        url = "http://%s:%d/live.wav" % (local_ip_for(ip), port)
+        dev.play_url(url)
+        out_json({"localout": "on", "sink": sink, "port": port, "url": url,
+                  "previousSink": prev_default,
+                  "note": "lossless 44.1 kHz; expect a few seconds of delay"})
+
+        stop = threading.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *a: stop.set())
+        while not stop.wait(0.5):
+            if pw.poll() is not None:
+                break
+    finally:
+        # Teardown: stop our stream on the device, restore the old default,
+        # unload the sink, kill the capture. Every step is best-effort.
+        with contextlib.suppress(Exception):
+            blob = json.dumps(dev.meta(), default=str)
+            if "/live.wav" in blob or str(port) in blob:
+                dev.stop()
+        if pw is not None and pw.poll() is None:
+            pw.terminate()
+            with contextlib.suppress(Exception):
+                pw.wait(timeout=3)
+        if srv is not None:
+            srv.shutdown()
+            srv.server_close()
+        if prev_default:
+            with contextlib.suppress(Exception):
+                pactl(["set-default-sink", prev_default])
+        with contextlib.suppress(Exception):
+            pactl(["unload-module", str(mod_index)])
+        out_json({"localout": "off", "restoredSink": prev_default})
+    return 0
+
+
+# --------------------------------------------------------------------------
 # daemon: watch + serve + stdin commands
 # --------------------------------------------------------------------------
 
@@ -1119,7 +1325,7 @@ def serve_url_base(srv, ip):
 # --------------------------------------------------------------------------
 
 def out_json(obj):
-    print(json.dumps(obj, indent=2, ensure_ascii=False))
+    print(json.dumps(obj, indent=2, ensure_ascii=False), flush=True)
 
 
 def main(argv=None):
@@ -1188,13 +1394,21 @@ def main(argv=None):
 
     p = sub.add_parser("serve", help="run the library file server")
     p.add_argument("--dir")
-    p.add_argument("--port", type=int, default=0)
+    p.add_argument("--port", type=int, default=SERVE_PORT_DEFAULT)
 
     p = sub.add_parser("daemon", help="resident watch+serve+stdin process")
     p.add_argument("--dir")
-    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--port", type=int, default=SERVE_PORT_DEFAULT)
     p.add_argument("--no-serve", action="store_true")
     p.add_argument("--interval", type=float, default=POLL_INTERVAL)
+
+    p = sub.add_parser("localout",
+                       help="stream desktop audio to the WiiM (live WAV)")
+    p.add_argument("--port", type=int, default=LOCALOUT_PORT_DEFAULT)
+    p.add_argument("--sink", default="wiim-out")
+
+    sub.add_parser("firewall",
+                   help="print the ufw rule for library + local audio out")
 
     p = sub.add_parser("media", help="media-key router (WiiM vs MPRIS)")
     p.add_argument("action", choices=["playPause", "play", "pause", "next",
@@ -1263,6 +1477,14 @@ def dispatch(args):
 
     if args.cmd == "daemon":
         return daemon_loop(args)
+
+    if args.cmd == "localout":
+        return cmd_localout(args)
+
+    if args.cmd == "firewall":
+        print("sudo ufw allow %d:%d/tcp comment 'ric.wiim: library + local audio out'"
+              % (SERVE_PORT_DEFAULT, LOCALOUT_PORT_DEFAULT))
+        return 0
 
     if args.cmd == "library":
         out_json(library_scan(music_dir_for(args), args.path))

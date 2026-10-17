@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "ric.wiim",
   "name": "WiiM Controller",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Ric",
   "license": "MIT",
-  "description": "WiiM / Linkplay zone in the bar: now playing, transport, seek, volume, presets, sources, EQ, sleep timer, and local-library streaming. Keyboard-first panel; backed by the bundled wiim CLI (local HTTPS API, no cloud).",
-  "kinds": ["bar-widget"],
+  "description": "WiiM / Linkplay zone in the bar: now playing, transport, seek, volume, presets, sources, EQ, sleep timer, local-library streaming, and desktop-audio-out (lossless live WAV). Keyboard-first panel; backed by the bundled wiim CLI (local HTTPS API, no cloud).",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
@@ -14,7 +16,13 @@
     "displayName": "WiiM",
     "description": "Control the WiiM zone: click for the panel, middle-click play/pause, scroll to change volume.",
     "category": "Media",
-    "aliases": ["wiim", "music", "tidal", "spotify", "play room"],
+    "aliases": [
+      "wiim",
+      "music",
+      "tidal",
+      "spotify",
+      "play room"
+    ],
     "allowMultiple": false,
     "defaultSection": "center",
     "defaults": {
@@ -23,7 +31,8 @@
       "volStep": 5,
       "pollMs": 500,
       "barText": true,
-      "fixture": false
+      "fixture": false,
+      "localoutPort": 7402
     },
     "schema": [
       {
@@ -70,6 +79,13 @@
         "type": "boolean",
         "label": "Fixture mode (demo data, no device)",
         "defaultValue": false
+      },
+      {
+        "key": "localoutPort",
+        "type": "integer",
+        "label": "Local audio out port",
+        "description": "TCP port the speaker pulls desktop audio from (open it: wiim firewall).",
+        "defaultValue": 7402
       }
     ]
   }

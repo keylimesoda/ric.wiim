@@ -37,6 +37,8 @@ Panel {
   readonly property int pollMs: Math.max(200, Math.min(2000, Number(setting("pollMs", 500)) || 500))
   readonly property bool barText: setting("barText", true) !== false
   readonly property bool fixtureMode: setting("fixture", false) === true
+  readonly property int localoutPort: Math.max(1024, Math.min(65535,
+      Number(setting("localoutPort", 7402)) || 7402))
 
   // ---- theme ---------------------------------------------------------------
   property var shell: null
@@ -392,6 +394,33 @@ Panel {
     Qt.callLater(function () { daemonProc.running = true })
   }
 
+  // ---- local audio out (experimental) --------------------------------------
+  // `wiim localout` owns the whole lifecycle: creates the PipeWire sink,
+  // streams it to the WiiM, and restores everything when the process ends.
+  // Stopping the process (toggle off, widget unload) triggers its teardown.
+  property bool localoutOn: false
+
+  Process {
+    id: localoutProc
+    command: (root.deviceIp
+              ? [root.bin, "--ip", root.deviceIp]
+              : [root.bin]).concat(
+              ["localout", "--port", String(root.localoutPort)])
+    running: false
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: root.localoutOn = false
+  }
+
+  function setLocalout(on) {
+    if (root.fixtureMode) return
+    if (on && !root.online) {
+      root.lastError = "no WiiM reachable — local audio out needs the speaker online"
+      return
+    }
+    root.localoutOn = on
+    localoutProc.running = on
+  }
+
   // progress + sleep countdown smoothing
   Timer {
     interval: 250
@@ -443,6 +472,10 @@ Panel {
   onFixtureModeChanged: {
     if (fixtureMode) {
       stopDaemon()
+      if (root.localoutOn) {
+        root.localoutOn = false
+        localoutProc.running = false
+      }
       initFixture()
     } else {
       snap = null
@@ -1186,10 +1219,48 @@ Panel {
                 : "—"
             }
 
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              ToggleSwitch {
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.localoutOn
+                interactive: root.online && !root.fixtureMode
+                foreground: root.fg
+                onToggled: root.setLocalout(checked)
+              }
+
+              Column {
+                width: parent.width - parent.children[0].implicitWidth - parent.spacing
+                spacing: 1
+                Text {
+                  width: parent.width
+                  text: "Local audio out"
+                  color: root.fg
+                  opacity: root.localoutOn ? 0.95 : 0.7
+                  font.family: root.ff
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+                Text {
+                  width: parent.width
+                  text: root.localoutOn
+                    ? "on · lossless 44.1 kHz · a few seconds behind"
+                    : "desktop audio → this WiiM"
+                  color: root.fg
+                  opacity: 0.5
+                  font.family: root.ff
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+            }
+
             Text {
               width: parent.width
               visible: root.loadStalled
-              text: "Stream not starting — device cannot reach the music server (AP client isolation?)"
+              text: "Stream not starting — the speaker cannot reach this PC (firewall? run: wiim firewall)"
               color: Color.urgent
               opacity: 0.9
               font.family: root.ff

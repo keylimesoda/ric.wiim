@@ -29,6 +29,9 @@ here for WiiM / Linkplay players.
 - **Local library streaming** — browse folders of FLAC/MP3 and hit
   `Enter`; the built-in HTTP server hands the player a direct URL.
   No import, no database.
+- **Desktop audio out** *(experimental)* — one toggle makes the WiiM
+  your computer's audio output: lossless live WAV, a few seconds
+  behind. See [Desktop audio out](#desktop-audio-out-experimental).
 - **CLI + IPC** — drive it from scripts, keybindings or dotfiles.
 - **Stdlib only** — the daemon is pure Python 3, no pip dependencies.
 
@@ -92,7 +95,31 @@ bin/wiim eq jazz                  # built-in EQ, or: eq off
 bin/wiim sleep 1800               # sleep timer, -1 = off
 bin/wiim play-url URL             # stream any direct URL
 bin/wiim library [PATH]           # browse the local music dir
+bin/wiim localout                 # stream desktop audio to the player
+bin/wiim firewall                 # print the firewall rule for inbound audio
 ```
+
+## Desktop audio out (experimental)
+
+Flip **Local audio out** in the panel's Device section (or run
+`bin/wiim localout` in a terminal) and your computer's audio output
+becomes the WiiM: a PipeWire sink is created and made the default, its
+monitor is streamed as an endless **lossless 44.1 kHz/16-bit WAV**, and
+the player is pointed at it. Toggle it off (or Ctrl-C) and everything
+is undone — old default output restored, sink removed, stream stopped.
+
+- **Expect a few seconds of delay.** The player buffers the stream;
+  fine for music in a room, not for watching video.
+- **One-time firewall rule** so the player can reach your PC:
+
+  ```bash
+  sudo ufw allow 7401:7402/tcp comment 'ric.wiim: library + local audio out'
+  ```
+
+  (`bin/wiim firewall` prints it. Port 7401 also serves the local
+  library; 7402 is the live stream.)
+- Starting playback elsewhere on the player (Tidal, a preset) simply
+  takes over; flip the toggle off and on again to return.
 
 ## Settings (shell.json layout entry)
 
@@ -103,6 +130,7 @@ bin/wiim library [PATH]           # browse the local music dir
 | `volStep` | `5` | scroll / key volume step |
 | `pollMs` | `500` | status poll rate (deeper state every 15 s) |
 | `barText` | `true` | show now-playing text in the bar |
+| `localoutPort` | `7402` | TCP port the player pulls desktop audio from |
 | `fixture` | `false` | demo data, no device |
 
 ## Tidal, radio, Bluetooth
@@ -127,10 +155,13 @@ is an explicit command; polling is read-only.
   them (hardware, not a bug). The panel notices and shows
   *"fixed level — control at the amp"* instead of a dead slider.
   Mute still works.
-- **Local streaming needs the player to reach your PC.** Some access
-  points enable *client isolation*, blocking device↔PC traffic. If
-  library playback stalls, the panel says exactly that. Radio presets
-  and Tidal are unaffected either way.
+- **Local streaming needs the player to reach your PC.** Open the
+  inbound ports once: `bin/wiim firewall` prints the ufw rule (a
+  default-deny firewall, not your router, is the usual blocker). Some
+  access points additionally enable *client isolation*, which no
+  firewall rule can undo — library playback and desktop audio out
+  stall there, and the panel says so. Radio presets and Tidal are
+  unaffected either way.
 
 ## Requirements
 
