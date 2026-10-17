@@ -1228,7 +1228,7 @@ Panel {
                 checked: root.localoutOn
                 interactive: root.online && !root.fixtureMode
                 foreground: root.fg
-                onToggled: root.setLocalout(checked)
+                onToggled: root.setLocalout(!checked)
               }
 
               Column {
