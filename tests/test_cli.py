@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -155,6 +157,7 @@ class TestWatch(CliTestCase):
         env = dict(os.environ, WIIM_BASE=self.srv.base)
         proc = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "bin", "wiim"),
+             "--config", os.path.join(tempfile.mkdtemp(), "config.json"),
              "--ip", "127.0.0.1", "watch", "--interval", "0.1"],
             stdout=subprocess.PIPE, text=True, env=env)
         try:
@@ -177,6 +180,7 @@ class TestDaemon(CliTestCase):
         env = dict(os.environ, WIIM_BASE=self.srv.base)
         proc = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "bin", "wiim"),
+             "--config", os.path.join(tempfile.mkdtemp(), "config.json"),
              "--ip", "127.0.0.1", "daemon", "--interval", "0.1",
              "--port", "0"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
@@ -413,3 +417,52 @@ class TestSignature(CliTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolution(unittest.TestCase):
+    def test_dhcp_recovery_matches_uuid_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            wiim.save_config(path, {"ip": "192.0.2.1", "uuid": "mine", "musicDir": "/music"})
+            args = SimpleNamespace(ip=None, config=path, timeout=0.1)
+            devices = [{"ip": "192.0.2.2", "uuid": "other"},
+                       {"ip": "192.0.2.3", "uuid": "mine", "hostname": "speaker.local"}]
+            with mock.patch.object(wiim.Device, "status_ex", side_effect=wiim.OfflineError("offline")), \
+                 mock.patch.object(wiim, "discover", return_value=devices):
+                self.assertEqual(wiim.resolve_ip(args), "192.0.2.3")
+            self.assertEqual(wiim.load_config(path), {"ip": "192.0.2.3", "uuid": "mine", "hostname": "speaker.local", "musicDir": "/music"})
+
+    def test_ambiguous_discovery_does_not_change_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            args = SimpleNamespace(ip=None, config=path, timeout=0.1)
+            with mock.patch.object(wiim, "discover", return_value=[{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}]):
+                with self.assertRaises(wiim.OfflineError): wiim.resolve_ip(args)
+            self.assertFalse(os.path.exists(path))
+
+    def test_explicit_old_address_keeps_identity_after_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            wiim.save_config(path, {"ip": "192.0.2.2", "configuredIp": "192.0.2.1", "uuid": "mine"})
+            args = SimpleNamespace(ip="192.0.2.1", config=path, timeout=0.1)
+            with mock.patch.object(wiim.Device, "status_ex", return_value={"uuid": "mine"}), \
+                 mock.patch.object(wiim, "discover") as discovery:
+                self.assertEqual(wiim.resolve_ip(args), "192.0.2.2")
+                discovery.assert_not_called()
+            self.assertEqual(wiim.load_config(path)["uuid"], "mine")
+
+    def test_cached_hostname_rejects_wrong_device_then_recovers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            wiim.save_config(path, {"ip": "192.0.2.1", "uuid": "mine", "hostname": "speaker.local"})
+            args = SimpleNamespace(ip=None, config=path, timeout=0.1)
+            with mock.patch.object(wiim.Device, "status_ex", side_effect=[{"uuid": "other"}, {"uuid": "mine"}]), \
+                 mock.patch.object(wiim.socket, "gethostbyname", return_value="192.0.2.4"), \
+                 mock.patch.object(wiim, "discover") as discovery:
+                self.assertEqual(wiim.resolve_ip(args), "192.0.2.4")
+                discovery.assert_not_called()
+            self.assertEqual(wiim.load_config(path)["ip"], "192.0.2.4")
+
+    def test_discover_json_flag(self):
+        with mock.patch.object(wiim, "discover", return_value=[{"ip": "192.0.2.1"}]):
+            self.assertEqual(wiim.main(["discover", "--json"]), 0)

@@ -176,6 +176,11 @@ failure leaves their routing alone and shows an error in the panel.
 | `localoutPort` | `7402` | TCP port the player pulls desktop audio from |
 | `fixture` | `false` | demo data, no device |
 
+The controller shares one daemon across bar widgets. It remembers the selected
+player’s UUID and last known address in `~/.config/wiim/config.json`; if that
+address stops responding, it tries the cached mDNS hostname and discovery.
+When no UUID is known, recovery requires exactly one discovered player.
+
 ## Tidal, radio, Bluetooth
 
 The player handles streaming services — this widget tells it what to

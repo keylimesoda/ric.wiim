@@ -55,9 +55,7 @@ Panel {
   property var serveInfo: null
   property bool daemonReady: false
   property string lastError: ""
-  property int cmdSeq: 0
   property var pendingKind: ({})   // seq -> result routing key
-  property int backoffMs: 1000
 
   // progress smoothing: device curpos is resynced by state/tick events;
   // between events we advance locally so the slider glides.
@@ -186,25 +184,41 @@ Panel {
   property real loadAtMs: 0
   property bool loadStalled: false
 
+  readonly property var wiimService: bar && bar.shell ? bar.shell.serviceFor("ric.wiim") : null
+  function configureService() {
+    if (!wiimService) return
+    wiimService.configure(bin, deviceIp, musicDir, pollMs, fixtureMode)
+    if (!fixtureMode && wiimService.helloLine) {
+      handleLine(wiimService.helloLine)
+      if (wiimService.stateLine) handleLine(wiimService.stateLine)
+    }
+  }
+  onWiimServiceChanged: Qt.callLater(configureService)
+  onDeviceIpChanged: configureService()
+  onMusicDirChanged: configureService()
+  onPollMsChanged: configureService()
+  Connections {
+    target: root.wiimService
+    function onLineReceived(line) { root.handleLine(line) }
+    function onStopped() { if (!root.fixtureMode) { root.daemonReady = false; root.pendingKind = ({}) } }
+  }
+
   // ---- actions --------------------------------------------------------------
   function sendCmd(cmd, args) {
     if (fixtureMode) { fixtureApply(cmd, args || {}); return }
-    if (!daemonProc.running) { lastError = "wiim daemon not running"; return }
-    cmdSeq += 1
-    var req = { id: cmdSeq, cmd: cmd }
-    if (args) req.args = args
-    daemonProc.write(JSON.stringify(req) + "\n")
+    var id = wiimService ? wiimService.send(cmd, args || {}) : -1
+    if (id < 0) { lastError = "wiim daemon not running"; return }
+    var m = {}; for (var k in pendingKind) m[k] = pendingKind[k]
+    m[id] = ""; pendingKind = m
   }
 
   function sendCmdTracked(kind, cmd, args) {
     if (fixtureMode) { fixtureApply(cmd, args || {}); return }
-    if (!daemonProc.running) return
-    cmdSeq += 1
+    if (!wiimService) return
+    var id = wiimService.send(cmd, args || {})
+    if (id < 0) return
     var m = {}; for (var k in pendingKind) m[k] = pendingKind[k]
-    m[cmdSeq] = kind; pendingKind = m
-    var req = { id: cmdSeq, cmd: cmd }
-    if (args) req.args = args
-    daemonProc.write(JSON.stringify(req) + "\n")
+    m[id] = kind; pendingKind = m
   }
 
   function patchSnapPlayer(part) {
@@ -322,7 +336,6 @@ Panel {
     if (obj.event === "hello") {
       daemonReady = true
       serveInfo = obj.serve || null
-      backoffMs = 1000
       lastError = ""
       refreshLibrary()
     } else if (obj.event === "state") {
@@ -334,6 +347,7 @@ Panel {
       lastError = obj.error || "offline"
     } else if (obj.id !== undefined) {
       var kind = pendingKind[obj.id]
+      if (kind === undefined) return
       if (kind !== undefined) {
         var m = {}; for (var k in pendingKind) if (k !== String(obj.id) && k !== obj.id) m[k] = pendingKind[k]
         pendingKind = m
@@ -357,49 +371,6 @@ Panel {
     curposLocal = s.player.curpos || 0
     curposTotal = s.player.totlen || 0
     if (s.eq && s.eq.stat === "Off") eqShown = "__off"
-  }
-
-  Process {
-    id: daemonProc
-    command: (root.deviceIp
-              ? [root.bin, "--ip", root.deviceIp]
-              : [root.bin]).concat(
-              ["daemon", "--dir", root.musicDir,
-               "--interval", String(root.pollMs / 1000)])
-    running: !root.fixtureMode
-    stdinEnabled: true
-    onStarted: if (root.fixtureMode) daemonProc.signal(15)
-
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function (data) { root.handleLine(data) }
-    }
-    stderr: StdioCollector { waitForEnd: true }
-
-    onExited: {
-      if (root.fixtureMode) return
-      root.daemonReady = false
-      restartTimer.restart()
-    }
-  }
-
-  Timer {
-    id: restartTimer
-    interval: root.backoffMs
-    onTriggered: {
-      root.backoffMs = Math.min(30000, root.backoffMs * 2)
-      if (!root.fixtureMode) daemonProc.running = true
-    }
-  }
-
-  // settings changes restart the daemon cleanly
-  onDeviceIpChanged: restartDaemon()
-  onMusicDirChanged: restartDaemon()
-  onPollMsChanged: restartDaemon()
-  function restartDaemon() {
-    if (root.fixtureMode) return
-    daemonProc.running = false
-    Qt.callLater(function () { daemonProc.running = true })
   }
 
   // One request owns checking, setup, connection, playback, and cancellation.
@@ -686,31 +657,13 @@ Panel {
     console.log("WIIM-INIT fixture mode armed")
   }
 
-  // A daemon that started before fixture mode was injected must be stopped:
-  // its live snapshots would otherwise overwrite the fixture state.
-  function stopDaemon() {
-    restartTimer.stop()
-    if (daemonProc.running) {
-      daemonProc.signal(15)
-      daemonProc.running = false
-    }
-  }
-
-  // The host injects `settings` after Component.onCompleted, so fixture mode
-  // must also be armed from the settings-changed edge, not only on completion.
   onFixtureModeChanged: {
+    configureService()
     if (fixtureMode) {
-      stopDaemon()
-      if (root.localoutOn) {
-        root.audioEvent({ type: "disable" })
-      }
+      if (root.localoutOn) root.audioEvent({ type: "disable" })
       initFixture()
     } else {
-      snap = null
-      daemonReady = false
-      libRows = []
-      libLoaded = false
-      restartDaemon()
+      snap = null; daemonReady = false; libRows = []; libLoaded = false
     }
   }
 
@@ -778,6 +731,7 @@ Panel {
     console.log("WIIM-INIT bin=" + root.bin + " ip=" + root.deviceIp +
       " fixture=" + root.fixtureMode + " kc=" + (keyCatcher !== undefined))
     if (root.fixtureMode) initFixture()
+    Qt.callLater(configureService)
   }
 
   onOpenedChanged: {
@@ -853,7 +807,7 @@ Panel {
 
     function dumpState(): string {
       return JSON.stringify({
-        online: root.online, status: root.status, daemonRunning: daemonProc.running,
+        online: root.online, status: root.status, daemonRunning: !!root.wiimService && root.wiimService.ready,
         daemonReady: root.daemonReady, lastError: root.lastError,
         fixtureMode: root.fixtureMode, settings: root.settings,
         serve: root.serveInfo, libPath: root.libPath, libRows: root.libRows.length,

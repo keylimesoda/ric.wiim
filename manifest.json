@@ -2,15 +2,17 @@
   "schemaVersion": 1,
   "id": "ric.wiim",
   "name": "WiiM Controller",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "author": "Ric",
   "license": "MIT",
   "description": "WiiM / Linkplay zone in the bar: now playing, transport, seek, volume, presets, sources, EQ, sleep timer, local-library streaming, and desktop-audio-out (lossless live WAV). Keyboard-first panel; backed by the bundled wiim CLI (local HTTPS API, no cloud).",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "WiiM",

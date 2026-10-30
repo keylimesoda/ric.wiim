@@ -166,17 +166,56 @@ def save_config(path, data):
 
 
 def resolve_ip(args):
-    if args.ip:
-        return args.ip
+    """Resolve a speaker, retaining its identity across address changes."""
     cfg = load_config(args.config)
-    ip = cfg.get("ip")
-    if ip:
-        return str(ip)
-    # last resort: quick discovery, first hit
-    for dev in discover(timeout=min(args.timeout, 2.5)):
-        return dev["ip"]
-    raise OfflineError("no device configured (wiim config set ip <ip> "
-                       "or run: wiim discover)")
+    configured = str(args.ip or cfg.get("ip") or "")
+    # An explicit selection different from the saved one is a new device.
+    same_device = not args.ip or args.ip in (str(cfg.get("ip", "")), str(cfg.get("configuredIp", "")))
+    if same_device and args.ip and cfg.get("configuredIp") == args.ip:
+        configured = str(cfg.get("ip") or args.ip)
+    uuid = str(cfg.get("uuid", "")) if same_device else ""
+    hostname = str(cfg.get("hostname", "")) if same_device else ""
+
+    def remember(ip, identity, host=""):
+        updated = dict(cfg, ip=ip)
+        if args.ip:
+            updated["configuredIp"] = args.ip
+        if identity:
+            updated["uuid"] = identity
+        elif not same_device:
+            updated.pop("uuid", None)
+        if host:
+            updated["hostname"] = host
+        elif not same_device:
+            updated.pop("hostname", None)
+        if updated != cfg:
+            try:
+                save_config(args.config, updated)
+            except OSError as e:
+                print("wiim: could not save device address: %s" % e, file=sys.stderr)
+        return ip
+
+    candidates = [configured] if configured else []
+    if hostname and hostname not in candidates:
+        candidates.append(hostname)
+    for candidate in candidates:
+        try:
+            info = Device(candidate, timeout=args.timeout).status_ex()
+            identity = str(info.get("uuid", ""))
+            if uuid and identity != uuid:
+                continue
+            ip = socket.gethostbyname(candidate)
+            return remember(ip, identity, hostname)
+        except (WiimError, OSError):
+            pass
+    devices = discover(timeout=min(args.timeout, 2.5))
+    if uuid:
+        devices = [dev for dev in devices if dev.get("uuid") == uuid]
+    # Without a recorded identity, only an unambiguous discovery is safe.
+    if len(devices) == 1:
+        dev = devices[0]
+        return remember(dev["ip"], dev.get("uuid", ""), dev.get("hostname", ""))
+    raise OfflineError("configured device unreachable or discovery is ambiguous")
 
 
 # --------------------------------------------------------------------------
@@ -581,7 +620,7 @@ SSDP_SEARCH = (
 
 
 def _avahi_linkplay(timeout):
-    """Resolve _linkplay._tcp via avahi-browse; returns [(ip, name)]."""
+    """Resolve _linkplay._tcp via avahi-browse; returns [(ip, name, hostname)]."""
     out = []
     try:
         r = subprocess.run(
@@ -595,9 +634,9 @@ def _avahi_linkplay(timeout):
         parts = line.split(";")
         if len(parts) < 8:
             continue
-        name, ip = parts[3], parts[7]
+        name, hostname, ip = parts[3], parts[6], parts[7]
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
-            out.append((ip, name))
+            out.append((ip, name, hostname))
     return out
 
 
@@ -645,8 +684,10 @@ def _ssdp_linkplay(timeout, found):
 def discover(timeout=2.5):
     """Find WiiM devices; validate each with getStatusEx."""
     found = {}
-    for ip, name in _avahi_linkplay(timeout):
+    hosts = {}
+    for ip, name, hostname in _avahi_linkplay(timeout):
         found.setdefault(ip, name)
+        hosts[ip] = hostname
     if not found:
         _ssdp_linkplay(timeout, found)
 
@@ -660,6 +701,7 @@ def discover(timeout=2.5):
                 "model": str(info.get("project", "")).replace("_", " "),
                 "firmware": str(info.get("firmware", "")),
                 "uuid": str(info.get("uuid", "")),
+                "hostname": hosts.get(ip, ""),
             })
         except (WiimError, OfflineError):
             continue
@@ -1474,6 +1516,19 @@ def daemon_loop(args):
             backoff = 1.0
         except (WiimError, OfflineError) as e:
             emit({"event": "offline", "error": str(e)})
+            # Retry resolution while resident, including DHCP changes after startup.
+            try:
+                recovered = resolve_ip(args)
+                if recovered != ip:
+                    ip = recovered
+                    dev = Device(ip, timeout=args.timeout)
+                    if serve_info:
+                        serve_info["urlBase"] = "http://%s:%d" % (local_ip_for(ip), srv.server_address[1])
+                    emit({"event": "hello", "ip": ip, "serve": serve_info})
+                    last_sig = None
+                    snap = None
+            except (WiimError, OSError):
+                pass
             time.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
             continue
@@ -1580,6 +1635,7 @@ def main(argv=None):
 
     p = sub.add_parser("discover", help="find WiiM devices via SSDP")
     p.add_argument("--timeout", type=float, default=2.5, dest="disc_timeout")
+    p.add_argument("--json", action="store_true", help="output JSON (the default)")
 
     p = sub.add_parser("status", help="merged snapshot as JSON")
     p.add_argument("--fast", action="store_true",
