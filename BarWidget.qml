@@ -184,7 +184,18 @@ Panel {
   property real loadAtMs: 0
   property bool loadStalled: false
 
-  readonly property var wiimService: bar && bar.shell ? bar.shell.serviceFor("ric.wiim") : null
+  property var wiimService: null
+  function findService() {
+    var found = bar && bar.shell ? bar.shell.serviceFor("ric.wiim") : null
+    if (found !== wiimService) wiimService = found
+    if (found) serviceLookupTimer.stop()
+  }
+  onBarChanged: { findService(); if (!wiimService) serviceLookupTimer.start() }
+  Timer {
+    id: serviceLookupTimer
+    interval: 1000; repeat: true; running: !root.wiimService
+    onTriggered: root.findService()
+  }
   function configureService() {
     if (!wiimService) return
     wiimService.configure(bin, deviceIp, musicDir, pollMs, fixtureMode)
@@ -193,7 +204,10 @@ Panel {
       if (wiimService.stateLine) handleLine(wiimService.stateLine)
     }
   }
-  onWiimServiceChanged: Qt.callLater(configureService)
+  onWiimServiceChanged: {
+    if (!wiimService) serviceLookupTimer.start()
+    else Qt.callLater(configureService)
+  }
   onDeviceIpChanged: configureService()
   onMusicDirChanged: configureService()
   onPollMsChanged: configureService()
