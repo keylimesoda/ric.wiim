@@ -1,3 +1,6 @@
+Source: pywiim (https://github.com/mjcumming/pywiim).
+Copyright and permission notice: see pywiim-LICENSE in this directory.
+
 Version 1.2
 
 HTTP API for WiiM PRODUCTS
