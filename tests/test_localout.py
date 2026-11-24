@@ -272,8 +272,8 @@ class LocaloutLifecycleTests(unittest.TestCase):
         args = SimpleNamespace(sink="fixture-out", port=0, timeout=1)
         # The URL must use the ephemeral port selected by the real HTTP server.
         real_server = wiim.LiveServer
-        def server(address, handler):
-            srv = real_server(address, handler)
+        def server(address, handler, allowed_ip):
+            srv = real_server(address, handler, allowed_ip)
             args.port = srv.server_address[1]
             return srv
 
@@ -394,7 +394,7 @@ class _SlowPipe:
 
 class LiveStreamTests(unittest.TestCase):
     def setUp(self):
-        self.srv = wiim.LiveServer(("127.0.0.1", 0), wiim.LiveHandler)
+        self.srv = wiim.LiveServer(("127.0.0.1", 0), wiim.LiveHandler, "127.0.0.1")
         self.srv.pcm = io.BytesIO(b"A" * wiim.LIVE_WAV_CHUNK * 3)
         self.srv.stream_lock = threading.Lock()
         self.thread = threading.Thread(target=self.srv.serve_forever,
@@ -414,6 +414,18 @@ class LiveStreamTests(unittest.TestCase):
             body = r.read()
         self.assertEqual(body, wiim.build_wav_header()
                          + b"A" * wiim.LIVE_WAV_CHUNK * 3)
+
+    def test_other_client_cannot_trigger_or_consume_stream(self):
+        self.srv.allowed_ip = "127.0.0.2"
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/live.wav", timeout=5)
+        self.assertEqual(cm.exception.code, 403)
+        self.assertFalse(self.srv.connected.is_set())
+        self.assertEqual(self.srv.pcm.tell(), 0)
+        self.assertFalse(self.srv.stream_lock.locked())
+        self.srv.allowed_ip = "127.0.0.1"
+        with urllib.request.urlopen(self.base + "/live.wav", timeout=5) as response:
+            self.assertEqual(response.status, 200)
 
     def test_other_paths_404(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:

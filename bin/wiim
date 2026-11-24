@@ -1112,6 +1112,9 @@ class LiveHandler(http.server.BaseHTTPRequestHandler):
         if urllib.parse.urlparse(self.path).path != "/live.wav":
             self.send_error(404)
             return
+        if self.client_address[0] != self.server.allowed_ip:
+            self.send_error(403)
+            return
         if not self.server.stream_lock.acquire(blocking=False):
             self.send_error(503)
             return
@@ -1139,8 +1142,9 @@ class LiveServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, server_address, handler, allowed_ip):
+        self.allowed_ip = str(ipaddress.IPv4Address(allowed_ip))
+        super().__init__(server_address, handler)
         self.initial_pcm = b""
         self.connected = threading.Event()
 
@@ -1332,7 +1336,7 @@ def cmd_localout(args):
 
         first_pcm = capture_first_pcm(pw, errors)
 
-        srv = LiveServer(("0.0.0.0", port), LiveHandler)
+        srv = LiveServer(("0.0.0.0", port), LiveHandler, ip)
         srv.pcm = pw.stdout
         srv.initial_pcm = first_pcm
         srv.stream_lock = threading.Lock()
